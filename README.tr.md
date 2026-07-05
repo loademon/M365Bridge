@@ -65,17 +65,57 @@ chmod +x m365-bridge-linux-amd64
 
 ### Docker
 
-GitHub Container Registry'den hazır imajı çekin:
+M365Bridge'i çalıştırmanın en kolay yolu Docker'dır. Hazır imaj GitHub Container Registry'de mevcuttur.
 
-```bash
-docker pull ghcr.io/kilimcininkoroglu/m365bridge:latest
+**Seçenek 1: Docker Compose (önerilen)**
+
+Bir `docker-compose.yml` dosyası oluşturun:
+
+```yaml
+services:
+  m365bridge:
+    image: ghcr.io/kilimcininkoroglu/m365bridge:latest
+    container_name: m365bridge
+    ports:
+      - "8230:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
 ```
 
-Veya Docker Compose ile derleyip çalıştırın:
+Sunucuyu başlatın:
+
+```bash
+docker compose up -d
+```
+
+API `http://localhost:8230` adresinde erişilebilir olacaktır.
+
+**Seçenek 2: Docker run**
+
+```bash
+docker run -d \
+  --name m365bridge \
+  -p 8230:8000 \
+  -v $(pwd)/data:/app/data \
+  --restart unless-stopped \
+  ghcr.io/kilimcininkoroglu/m365bridge:latest
+```
+
+**Seçenek 3: Kaynaktan derleme**
+
+Hazır imaj yerine kendiniz derlemek isterseniz:
 
 ```bash
 docker compose up --build -d
 ```
+
+**Notlar:**
+
+- `data/` dizini token'ları, önbelleği ve yapılandırmayı saklar. İlk çalıştırmada otomatik oluşturulur.
+- Port `8230` (host) ile `8000` (container) arasında eşleştirilir. Host portunu `docker-compose.yml` veya `-p` parametresinden değiştirebilirsiniz.
+- Container varsayılan olarak `serve --port 8000` ile başlar.
+- Container'ı başlattıktan sonra kimlik doğrulamayı yapılandırmak için kurulum sihirbazını çalıştırın: `docker exec -it m365bridge ./bin/m365-bridge setup-wizard`
 
 ## Yapılandırma
 

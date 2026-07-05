@@ -65,17 +65,57 @@ chmod +x m365-bridge-linux-amd64
 
 ### Docker
 
-Pull the pre-built image from GitHub Container Registry:
+The easiest way to run M365Bridge is with Docker. The pre-built image is available on GitHub Container Registry.
 
-```bash
-docker pull ghcr.io/kilimcininkoroglu/m365bridge:latest
+**Option 1: Docker Compose (recommended)**
+
+Create a `docker-compose.yml` file:
+
+```yaml
+services:
+  m365bridge:
+    image: ghcr.io/kilimcininkoroglu/m365bridge:latest
+    container_name: m365bridge
+    ports:
+      - "8230:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
 ```
 
-Or build and run with Docker Compose:
+Start the server:
+
+```bash
+docker compose up -d
+```
+
+The API will be available at `http://localhost:8230`.
+
+**Option 2: Docker run**
+
+```bash
+docker run -d \
+  --name m365bridge \
+  -p 8230:8000 \
+  -v $(pwd)/data:/app/data \
+  --restart unless-stopped \
+  ghcr.io/kilimcininkoroglu/m365bridge:latest
+```
+
+**Option 3: Build from source**
+
+If you want to build the image yourself instead of using the pre-built one:
 
 ```bash
 docker compose up --build -d
 ```
+
+**Notes:**
+
+- The `data/` directory stores tokens, cache, and configuration. It is created automatically on first run.
+- Port `8230` (host) maps to port `8000` (container). Change the host port in `docker-compose.yml` or the `-p` flag if needed.
+- The container starts with `serve --port 8000` by default.
+- After starting the container, run the setup wizard to configure authentication: `docker exec -it m365bridge ./bin/m365-bridge setup-wizard`
 
 ## Configuration
 
