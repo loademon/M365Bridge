@@ -19,8 +19,8 @@ import (
 
 // ToolDef represents a tool definition from the client request.
 type ToolDef struct {
-	Type     string         `json:"type"`
-	Function ToolDefFunc    `json:"function"`
+	Type     string      `json:"type"`
+	Function ToolDefFunc `json:"function"`
 	// Anthropic-style fields (flat, no "function" wrapper)
 	Name        string                 `json:"name,omitempty"`
 	Description string                 `json:"description,omitempty"`
@@ -50,8 +50,9 @@ func nextToolCallID() string {
 	return fmt.Sprintf("call_%d", toolCallIDCounter)
 }
 
-// toolCallPattern matches JSON blocks wrapped in <tool_call> tags.
-var toolCallPattern = regexp.MustCompile(`(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>`)
+// toolCallPattern matches JSON blocks wrapped in angle-bracket tool tags.
+// The tag name is "tool" and the content is a JSON object with name and arguments.
+var toolCallPattern = regexp.MustCompile(`(?s)<tool>\s*(\{.*?\})\s*</tool>`)
 
 // InjectTools prepends tool definitions and instructions to the last user message.
 // Returns the modified message text. If no tools are provided, returns the original text.
@@ -74,17 +75,37 @@ func InjectTools(messages []string, tools []ToolDef) []string {
 }
 
 // buildToolInstruction creates the system prompt that tells the model about available tools
-// and the format to use when calling them.
+// and the format to use when calling them. The prompt is deliberately forceful to override
+// the M365 backend's tendency to use its own built-in tools (code_interpreter, search)
+// instead of the client-defined tools.
 func buildToolInstruction(tools []ToolDef) string {
 	var sb strings.Builder
 
-	sb.WriteString("[TOOL CALLING INSTRUCTIONS]\n")
-	sb.WriteString("You have access to the following tools. When you need to use a tool, ")
-	sb.WriteString("respond with a tool call block in this exact format:\n")
-	sb.WriteString("<tool_call>{\"name\":\"tool_name\",\"arguments\":{...}}</tool_call>\n")
-	sb.WriteString("You can include explanatory text before the tool call block. ")
-	sb.WriteString("Use only one tool call per response. Do not wrap the JSON in markdown code fences.\n\n")
-	sb.WriteString("[AVAILABLE TOOLS]\n")
+	sb.WriteString("=== MANDATORY TOOL USE PROTOCOL ===\n")
+	sb.WriteString("You are operating as a tool-calling assistant. The tools listed below are the ONLY tools you may use. ")
+	sb.WriteString("You do NOT have access to code_interpreter, web search, or any other built-in tools for this request. ")
+	sb.WriteString("Do NOT attempt to use code_interpreter, search, or any tool not listed below. ")
+	sb.WriteString("Do NOT say that a tool is unavailable or not in your environment. The tools below ARE available to you.\n\n")
+
+	sb.WriteString("When the user's request requires using a tool, you MUST respond with a tool call. ")
+	sb.WriteString("A tool call is a JSON object wrapped in angle-bracket tool tags, like this:\n")
+	sb.WriteString("<tool>{\"name\":\"tool_name\",\"arguments\":{\"key\":\"value\"}}</tool>\n\n")
+
+	sb.WriteString("CRITICAL RULES:\n")
+	sb.WriteString("1. When a tool is needed, output the tool call block. Do NOT use markdown code fences around it.\n")
+	sb.WriteString("2. The tool call MUST be wrapped in <tool> and </tool> tags.\n")
+	sb.WriteString("3. The JSON inside must have \"name\" and \"arguments\" fields. Arguments must be a JSON object.\n")
+	sb.WriteString("4. Do NOT use your built-in code_interpreter or search tools. Use ONLY the tools listed below.\n")
+	sb.WriteString("5. If the user asks you to read/write a file, list a directory, or perform any action that matches a tool below, you MUST call that tool.\n")
+	sb.WriteString("6. Do NOT refuse by saying the tool is unavailable. It IS available. Call it.\n")
+	sb.WriteString("7. You may include a brief explanation before the tool call block, but the tool call block MUST be present.\n\n")
+
+	sb.WriteString("EXAMPLE:\n")
+	sb.WriteString("User: Create a file called test.txt with content \"hello\"\n")
+	sb.WriteString("Your response: I'll create that file for you.\n")
+	sb.WriteString("<tool>{\"name\":\"write_file\",\"arguments\":{\"path\":\"test.txt\",\"content\":\"hello\"}}</tool>\n\n")
+
+	sb.WriteString("=== AVAILABLE TOOLS ===\n")
 
 	for _, tool := range tools {
 		name := tool.Function.Name
@@ -114,10 +135,13 @@ func buildToolInstruction(tools []ToolDef) string {
 		sb.WriteString("\n")
 	}
 
+	sb.WriteString("=== END TOOL DEFINITIONS ===\n")
+	sb.WriteString("Remember: When a tool is needed, respond with the <tool>...</tool> block. Do NOT use code_interpreter or search. Do NOT refuse.\n")
+
 	return sb.String()
 }
 
-// ParseToolCalls scans response text for <tool_call> blocks and extracts them.
+// ParseToolCalls scans response text for <tool> blocks and extracts them.
 // Returns the text with tool call blocks removed and the parsed tool calls.
 // If no tool call blocks are found, returns the original text and nil.
 func ParseToolCalls(text string) (string, []ToolCall) {
