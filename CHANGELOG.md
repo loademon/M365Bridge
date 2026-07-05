@@ -5,6 +5,19 @@ All notable changes to M365Bridge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-07-05
+
+### Added
+- SSO cookie-based re-authentication as fallback when 24h refresh token expires (AADSTS700084)
+- SSO cookie capture during setup-wizard via `sso_cookies` field in setup.json
+- Setup and token renewal process improvements
+
+### Changed
+- Docker setup documentation improved with single step-by-step flow
+
+### Fixed
+- SSO re-authentication reliability improvements (sso_reload=True, response_mode=fragment, correct redirect_uri, Origin header for SPA token exchange)
+
 ## [1.0.2] - 2026-07-05
 
 ### Changed
