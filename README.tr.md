@@ -439,17 +439,17 @@ print(resp.choices[0].message.content)
 
 Tüm model seçimi, M365 backend'ine gönderilen `tone` alanı ile yapılır. Tüm modeller için `Override` alanı boştur. GPT-5.x modelleri GPT-5 backend'ine; Claude modelleri gerçek Anthropic Claude modellerine yönlendirilir (tone testi ile doğrulanmıştır).
 
-| Anahtar            | Tone              | OpenAI ID           | Düşünme? | Backend |
-|--------------------|-------------------|---------------------|----------|---------|
-| `auto`             | Magic             | gpt-4-auto          | Hayır    | GPT-5   |
-| `quick`            | Chat              | gpt-4-quick         | Hayır    | GPT-5   |
-| `reasoning`        | Magic             | gpt-4-reasoning     | Hayır    | GPT-5   |
-| `gpt5.5`           | Gpt_5_5_Chat      | gpt-5.5             | Hayır    | GPT-5   |
-| `gpt5.5-reasoning` | Gpt_5_5_Reasoning | gpt-5.5-reasoning   | Evet     | GPT-5   |
-| `claude`           | Claude_Sonnet     | claude-sonnet-4.6   | Hayır    | Claude  |
-| `claude-sonnet`    | Claude_Sonnet     | claude-sonnet-4.6   | Hayır    | Claude  |
-| `claude-opus`      | Claude_Opus       | claude-opus-4.6     | Hayır    | Claude  |
-| `claude-sonnet-4-20250514` | Claude_Sonnet | claude-sonnet-4.6 | Hayır   | Claude  |
+| Anahtar                    | Tone              | OpenAI ID         | Düşünme? | Backend |
+|----------------------------|-------------------|-------------------|----------|---------|
+| `auto`                     | Magic             | gpt-4-auto        | Hayır    | GPT-5   |
+| `quick`                    | Chat              | gpt-4-quick       | Hayır    | GPT-5   |
+| `reasoning`                | Magic             | gpt-4-reasoning   | Hayır    | GPT-5   |
+| `gpt5.5`                   | Gpt_5_5_Chat      | gpt-5.5           | Hayır    | GPT-5   |
+| `gpt5.5-reasoning`         | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Evet     | GPT-5   |
+| `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
+| `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
+| `claude-opus`              | Claude_Opus       | claude-opus-4.6   | Hayır    | Claude  |
+| `claude-sonnet-4-20250514` | Claude_Sonnet     | claude-sonnet-4.6 | Hayır    | Claude  |
 
 ### Hangi modeli kullanmalıyım?
 
