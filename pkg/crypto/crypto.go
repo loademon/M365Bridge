@@ -12,6 +12,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 )
 
 const (
@@ -45,10 +47,12 @@ func loadOrCreateKey() ([]byte, error) {
 
 	// Try to load existing key
 	if keyData, err := os.ReadFile(keyPath); err == nil {
+		logging.Debug("crypto: loaded existing encryption key")
 		return keyData, nil
 	}
 
 	// Create new key
+	logging.Info("crypto: creating new encryption key")
 	keyDir := filepath.Dir(keyPath)
 	if err := os.MkdirAll(keyDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create key directory: %w", err)

@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/client"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/toolcalling"
@@ -171,9 +171,9 @@ func (api *APIServer) Start(port int) error {
 	go api.runTokenRefresher()
 
 	if len(api.config.APIKeys) > 0 {
-		log.Printf("Starting API server on port %d (API key required, %d key(s) configured)", port, len(api.config.APIKeys))
+		logging.Infof("Starting API server on port %d (API key required, %d key(s) configured)", port, len(api.config.APIKeys))
 	} else {
-		log.Printf("Starting API server on port %d (no API key required)", port)
+		logging.Infof("Starting API server on port %d (no API key required)", port)
 	}
 	return api.server.ListenAndServe()
 }
@@ -189,16 +189,20 @@ func (api *APIServer) runTokenRefresher() {
 	for {
 		select {
 		case <-api.stopCh:
+			logging.Info("Token refresher stopping")
 			return
 		case <-ticker.C:
+			logging.Debug("Token refresher: starting periodic refresh")
 			if _, err := api.tokenManager.Refresh(); err != nil {
-				log.Printf("Background token refresh failed: %v", err)
+				logging.Errorf("Background token refresh failed: %v", err)
 			} else {
-				log.Println("Background token refresh succeeded")
+				logging.Info("Background token refresh succeeded")
 			}
 			// Refresh designer token to keep broker RT rotated
 			if _, err := api.tokenManager.GetDesignerToken(); err != nil {
-				log.Printf("Background designer token refresh failed: %v", err)
+				logging.Errorf("Background designer token refresh failed: %v", err)
+			} else {
+				logging.Debug("Background designer token refresh succeeded")
 			}
 		}
 	}
@@ -208,6 +212,7 @@ func (api *APIServer) runTokenRefresher() {
 // If no API keys are configured, all requests are allowed (backward compatible).
 func (api *APIServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		logging.Debugf("Request: %s %s %s", r.Method, r.URL.Path, r.RemoteAddr)
 		if r.Method == http.MethodOptions {
 			next(w, r)
 			return
@@ -215,11 +220,13 @@ func (api *APIServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		if len(api.config.APIKeys) > 0 {
 			provided := r.Header.Get("Authorization")
 			if provided == "" {
+				logging.Warnf("Auth: missing Authorization header from %s", r.RemoteAddr)
 				api.sendError(w, http.StatusUnauthorized, "Missing Authorization header")
 				return
 			}
 			token := strings.TrimSpace(strings.TrimPrefix(provided, "Bearer "))
 			if !api.isValidAPIKey(token) {
+				logging.Warnf("Auth: invalid API key from %s", r.RemoteAddr)
 				api.sendError(w, http.StatusUnauthorized, "Invalid API key")
 				return
 			}
@@ -429,6 +436,7 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	}
 
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		logging.Errorf("handleChatCompletions: invalid JSON: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
@@ -437,9 +445,11 @@ func (api *APIServer) handleChatCompletions(w http.ResponseWriter, r *http.Reque
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
 	cfg := models.LookupModel(modelKey)
 	if cfg.OpenAIID == "" {
+		logging.Errorf("handleChatCompletions: unknown model: %s", modelKey)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
 		return
 	}
+	logging.Infof("handleChatCompletions: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
 	// Handle JSON mode
 	if req.ResponseFormat != nil {
@@ -571,6 +581,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	}
 
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		logging.Errorf("handleAnthropicMessages: invalid JSON: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
@@ -579,6 +590,7 @@ func (api *APIServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Req
 	modelKey, modelSessionID := parseModelSessionID(req.Model)
 	// Map Anthropic model to internal model
 	cfg := models.LookupModel(modelKey)
+	logging.Infof("handleAnthropicMessages: model=%s stream=%v tools=%d sid=%s", modelKey, req.Stream, len(req.Tools), modelSessionID)
 
 	// Build chat messages with system prompt prepended
 	chatMessages := []payload.Message{}
@@ -1632,6 +1644,8 @@ func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convI
 		return
 	}
 
+	logging.Infof("uploadImagesAndAnnotate: uploading %d images for message[%d] convID=%s", len((*messages)[lastImgIdx].Images), lastImgIdx, convID)
+
 	// Use existing convID or generate a temporary UUID for upload
 	uploadConvID := convID
 	if uploadConvID == "" {
@@ -1642,11 +1656,11 @@ func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convI
 	for _, img := range msg.Images {
 		result, err := api.m365Client.UploadFile(img.Base64, img.MediaType, img.FileName, uploadConvID, api.config.UserOID, api.config.TenantID)
 		if err != nil {
-			log.Printf("Image upload failed: %v", err)
+			logging.Errorf("Image upload failed: %v", err)
 			continue
 		}
 		if !result.IsSuccess {
-			log.Printf("Image upload returned non-success: %+v", result)
+			logging.Warnf("Image upload returned non-success: %+v", result)
 			continue
 		}
 
@@ -1798,7 +1812,7 @@ func init() {
 	if err != nil {
 		enc, err = tiktoken.GetEncoding("cl100k_base")
 		if err != nil {
-			log.Printf("Failed to init tiktoken encoder, falling back to space split: %v", err)
+			logging.Warnf("Failed to init tiktoken encoder, falling back to space split: %v", err)
 		}
 	}
 	tokenEncoder = enc
@@ -2649,6 +2663,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 
 	var req imageGenerationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		logging.Errorf("handleImageGenerations: invalid JSON: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON: %v", err))
 		return
 	}
@@ -2656,6 +2671,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 		api.sendError(w, http.StatusBadRequest, "prompt is required")
 		return
 	}
+	logging.Infof("handleImageGenerations: model=%s n=%d size=%s responseFormat=%s sid=%s", req.Model, req.N, req.Size, req.ResponseFormat, req.SessionID)
 	if req.N <= 0 {
 		req.N = 1
 	}
@@ -2738,6 +2754,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 
 	// Parse multipart form
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		logging.Errorf("handleImageEdits: failed to parse multipart form: %v", err)
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Failed to parse multipart form: %v", err))
 		return
 	}
@@ -2758,6 +2775,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 		api.sendError(w, http.StatusBadRequest, fmt.Sprintf("Unknown model: %s", modelKey))
 		return
 	}
+	logging.Infof("handleImageEdits: model=%s prompt_len=%d images=%d responseFormat=%s", modelKey, len(prompt), len(r.MultipartForm.File["image"]), r.FormValue("response_format"))
 
 	n := 1
 	if nStr := r.FormValue("n"); nStr != "" {
@@ -2941,7 +2959,7 @@ func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt
 		if responseFormat == "b64_json" {
 			b64, err := api.downloadAndBase64(u)
 			if err != nil {
-				log.Printf("Failed to download image %s: %v", u, err)
+				logging.Errorf("Failed to download image %s: %v", u, err)
 				items = append(items, imageDataItem{
 					URL:           u,
 					RevisedPrompt: revisedPrompt,
@@ -2957,7 +2975,7 @@ func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt
 			// fall back to raw URL on error
 			b64, err := api.downloadAndBase64(u)
 			if err != nil {
-				log.Printf("Failed to download image for data URL %s: %v", u, err)
+				logging.Errorf("Failed to download image for data URL %s: %v", u, err)
 				items = append(items, imageDataItem{
 					URL:           u,
 					RevisedPrompt: revisedPrompt,
@@ -2979,8 +2997,10 @@ func (api *APIServer) buildOpenAIImageData(respText string, n int, revisedPrompt
 // via SSO cookies with the M365 web app client_id) and the fileToken query
 // parameter sent as a header.
 func (api *APIServer) downloadAndBase64(imageURL string) (string, error) {
+	logging.Infof("downloadAndBase64: downloading image from %s", imageURL[:min(100, len(imageURL))])
 	parsedURL, err := neturl.Parse(imageURL)
 	if err != nil {
+		logging.Errorf("downloadAndBase64: invalid URL: %v", err)
 		return "", fmt.Errorf("invalid image URL: %w", err)
 	}
 
@@ -2988,6 +3008,7 @@ func (api *APIServer) downloadAndBase64(imageURL string) (string, error) {
 	query := parsedURL.Query()
 	fileToken := query.Get("fileToken")
 	if fileToken == "" {
+		logging.Errorf("downloadAndBase64: no fileToken in URL")
 		return "", fmt.Errorf("no fileToken in image URL")
 	}
 	query.Del("fileToken")
@@ -3026,16 +3047,18 @@ func (api *APIServer) downloadAndBase64(imageURL string) (string, error) {
 		body, _ := io.ReadAll(resp.Body)
 		errCode := resp.Header.Get("X-Errorcode")
 		failReason := resp.Header.Get("X-Failurereason")
-		log.Printf("Image download failed: status=%d, x-errorcode=%s, x-failurereason=%s, body=%s",
+		logging.Errorf("Image download failed: status=%d, x-errorcode=%s, x-failurereason=%s, body=%s",
 			resp.StatusCode, errCode, failReason, string(body)[:min(200, len(body))])
 		return "", fmt.Errorf("download returned status %d: x-errorcode=%s, x-failurereason=%s", resp.StatusCode, errCode, failReason)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		logging.Errorf("downloadAndBase64: failed to read body: %v", err)
 		return "", fmt.Errorf("failed to read response body: %w", err)
 	}
 
+	logging.Infof("downloadAndBase64: success, size=%d bytes", len(body))
 	return base64.StdEncoding.EncodeToString(body), nil
 }
 

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/crypto"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 )
 
 const (
@@ -117,10 +118,14 @@ func hasSSOCookies() bool {
 // It uses the OAuth2 authorize endpoint with prompt=none and PKCE.
 // If the SSO session is still valid, it returns new access and refresh tokens.
 func (tm *TokenManager) reauthWithSSO() (string, error) {
+	logging.Info("reauthWithSSO: starting SSO cookie re-authentication")
 	store, err := tm.loadSSOCookies()
 	if err != nil {
+		logging.Errorf("reauthWithSSO: no SSO cookies available: %v", err)
 		return "", fmt.Errorf("%w: no SSO cookies available: %v", ErrRefreshFailed, err)
 	}
+
+	logging.Debugf("reauthWithSSO: loaded %d SSO cookies captured at %s", len(store.Cookies), store.CapturedAt.Format(time.RFC3339))
 
 	// Build Cookie header string from SSO cookies
 	var cookieParts []string
@@ -216,6 +221,7 @@ func (tm *TokenManager) reauthWithSSO() (string, error) {
 			}
 			if authCode != "" {
 				// Exchange auth code for tokens
+				logging.Info("reauthWithSSO: obtained auth code, exchanging for tokens")
 				return tm.exchangeAuthCode(authCode, verifier, cookieHeader)
 			}
 		}
@@ -346,6 +352,7 @@ func (tm *TokenManager) exchangeAuthCode(authCode, verifier, cookieHeader string
 		return "", fmt.Errorf("%w: failed to write cache: %v", ErrRefreshFailed, err)
 	}
 
+	logging.Infof("exchangeAuthCode: success, expires_in=%d", result.ExpiresIn)
 	return result.AccessToken, nil
 }
 
@@ -395,14 +402,17 @@ func (tm *TokenManager) GetDesignerToken() (string, error) {
 		var cache designerTokenCache
 		if json.Unmarshal(data, &cache) == nil {
 			if time.Now().Unix() < cache.ExpiresAt-60 {
+				logging.Debug("GetDesignerToken: cache hit")
 				return cache.AccessToken, nil
 			}
 		}
 	}
 
+	logging.Info("GetDesignerToken: cache miss, acquiring new token")
 	// Acquire new token via broker refresh token flow
 	token, expiresIn, err := tm.acquireDesignerToken()
 	if err != nil {
+		logging.Errorf("GetDesignerToken: failed to acquire token: %v", err)
 		return "", err
 	}
 
@@ -414,6 +424,7 @@ func (tm *TokenManager) GetDesignerToken() (string, error) {
 	cacheData, _ := json.Marshal(cache)
 	os.WriteFile(designerTokenCacheFile, cacheData, 0600)
 
+	logging.Infof("GetDesignerToken: success, expires_in=%d", expiresIn)
 	return token, nil
 }
 
@@ -426,10 +437,14 @@ func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
 	refreshToken, err := tm.readBrokerRefreshToken()
 	if err != nil {
 		// No broker refresh token; acquire one via SSO cookies
+		logging.Info("acquireDesignerToken: no broker refresh token, acquiring via SSO cookies")
 		refreshToken, err = tm.acquireBrokerRefreshTokenViaSSO()
 		if err != nil {
+			logging.Errorf("acquireDesignerToken: failed to acquire broker refresh token: %v", err)
 			return "", 0, fmt.Errorf("failed to acquire broker refresh token: %w", err)
 		}
+	} else {
+		logging.Debug("acquireDesignerToken: using existing broker refresh token")
 	}
 
 	// Build the broker token URL with query parameters
@@ -513,8 +528,10 @@ func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
 // the standard refresh token (issued for spalanding redirect URI) is not
 // compatible with the broker flow (which requires brk-multihub:// redirect URI).
 func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
+	logging.Info("acquireBrokerRefreshTokenViaSSO: starting broker authorize flow via SSO cookies")
 	store, err := tm.loadSSOCookies()
 	if err != nil {
+		logging.Errorf("acquireBrokerRefreshTokenViaSSO: no SSO cookies: %v", err)
 		return "", fmt.Errorf("no SSO cookies for broker authorize: %w", err)
 	}
 
@@ -603,6 +620,7 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 	}
 
 	// Exchange auth code for token + refresh token via broker flow
+	logging.Info("acquireBrokerRefreshTokenViaSSO: obtained auth code, exchanging for broker tokens")
 	return tm.exchangeBrokerAuthCode(authCode, verifier)
 }
 
@@ -669,6 +687,7 @@ func (tm *TokenManager) exchangeBrokerAuthCode(authCode, verifier string) (strin
 		return "", fmt.Errorf("failed to save broker refresh token: %w", err)
 	}
 
+	logging.Info("exchangeBrokerAuthCode: success, broker refresh token saved")
 	return result.RefreshToken, nil
 }
 

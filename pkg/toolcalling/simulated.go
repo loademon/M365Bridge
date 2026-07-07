@@ -14,6 +14,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 )
 
 // BuildSimulatedPrompt constructs the prompt sent to M365 Copilot in simulated
@@ -119,9 +121,11 @@ func ParseSimulatedResponse(text string, allowedToolNames []string) SimulatedRes
 	result := SimulatedResult{FinishReason: "stop"}
 	candidates := enumerateJSONCandidates(text)
 	if len(candidates) == 0 {
+		logging.Debug("ParseSimulatedResponse: no JSON candidates found")
 		return result
 	}
 
+	logging.Debugf("ParseSimulatedResponse: found %d JSON candidates, allowedTools=%v", len(candidates), allowedToolNames)
 	var best map[string]interface{}
 	bestScore := -1 << 30
 	for _, raw := range candidates {
@@ -136,11 +140,17 @@ func ParseSimulatedResponse(text string, allowedToolNames []string) SimulatedRes
 		}
 	}
 	if best == nil || bestScore <= 0 {
+		logging.Debugf("ParseSimulatedResponse: no valid candidate (bestScore=%d)", bestScore)
 		return result
 	}
 
 	result.HasPayload = true
 	parseChatCompletionPayload(best, &result, allowed)
+	if len(result.ToolCalls) > 0 {
+		logging.Infof("ParseSimulatedResponse: parsed %d tool calls", len(result.ToolCalls))
+	} else if result.Content != "" {
+		logging.Debug("ParseSimulatedResponse: parsed plain content response")
+	}
 	return result
 }
 

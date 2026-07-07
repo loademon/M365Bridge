@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"regexp"
@@ -19,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/payload"
 )
@@ -104,8 +104,10 @@ type UploadResult struct {
 // conversationID is the M365 conversation ID (use a random UUID for new conversations).
 // userOID and tenantID are used for the x-anchormailbox header.
 func (c *M365Client) UploadFile(base64Data, mediaType, fileName, conversationID, userOID, tenantID string) (*UploadResult, error) {
+	logging.Infof("UploadFile: starting upload fileName=%s mediaType=%s convID=%s", fileName, mediaType, conversationID)
 	token, err := c.tokenManager.Get()
 	if err != nil {
+		logging.Errorf("UploadFile: failed to get token: %v", err)
 		return nil, fmt.Errorf("failed to get token: %w", err)
 	}
 
@@ -135,16 +137,19 @@ func (c *M365Client) UploadFile(base64Data, mediaType, fileName, conversationID,
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		logging.Errorf("UploadFile: request failed: %v", err)
 		return nil, fmt.Errorf("upload request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		logging.Errorf("UploadFile: failed to read response: %v", err)
 		return nil, fmt.Errorf("failed to read upload response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		logging.Errorf("UploadFile: upload failed status=%d body=%s", resp.StatusCode, string(respBody)[:min(300, len(respBody))])
 		return nil, fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -171,8 +176,10 @@ func (c *M365Client) UploadFile(base64Data, mediaType, fileName, conversationID,
 // dialConnection opens a new WebSocket connection for a single request.
 // The caller is responsible for closing the connection when done.
 func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*websocket.Conn, string, string, error) {
+	logging.Debugf("dialConnection: convID=%s", conversationID)
 	token, err := c.tokenManager.Get()
 	if err != nil {
+		logging.Errorf("dialConnection: failed to get token: %v", err)
 		return nil, "", "", fmt.Errorf("failed to get token: %w", err)
 	}
 
@@ -190,11 +197,13 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 
 	conn, _, err := dialer.Dial(url, nil)
 	if err != nil {
+		logging.Errorf("dialConnection: WebSocket dial failed: %v", err)
 		return nil, "", "", fmt.Errorf("failed to dial: %w", err)
 	}
 
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(handshakeMessage)); err != nil {
 		conn.Close()
+		logging.Errorf("dialConnection: handshake write failed: %v", err)
 		return nil, "", "", fmt.Errorf("%w: %v", ErrHandshakeFailed, err)
 	}
 
@@ -202,16 +211,19 @@ func (c *M365Client) dialConnection(conversationID, userOID, tenantID string) (*
 	_, _, err = conn.ReadMessage()
 	if err != nil {
 		conn.Close()
+		logging.Errorf("dialConnection: handshake read failed: %v", err)
 		return nil, "", "", fmt.Errorf("%w: %v", ErrHandshakeFailed, err)
 	}
 	conn.SetReadDeadline(time.Time{})
 
+	logging.Debug("dialConnection: WebSocket connected and handshake OK")
 	return conn, hexSID, uuidSID, nil
 }
 
 // Chat sends a single message and returns the complete response.
 // When hasTools is true, code_interpreter option flags are stripped from the payload.
 func (c *M365Client) Chat(text, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, error) {
+	logging.Infof("Chat: tone=%s override=%s convID=%s hasTools=%v", tone, gptOverride, conversationID, hasTools)
 	conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
 	if err != nil {
 		return "", err
@@ -255,6 +267,7 @@ type StreamChunk struct {
 // ChatStreamGen generates a stream of response chunks.
 // When hasTools is true, code_interpreter option flags are stripped from the payload.
 func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) <-chan StreamChunk {
+	logging.Infof("ChatStreamGen: tone=%s override=%s convID=%s hasTools=%v", tone, gptOverride, conversationID, hasTools)
 	ch := make(chan StreamChunk)
 
 	go func() {
@@ -262,6 +275,7 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 
 		conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
 		if err != nil {
+			logging.Errorf("ChatStreamGen: dial failed: %v", err)
 			ch <- StreamChunk{Error: err}
 			return
 		}
@@ -269,14 +283,17 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 
 		payloadStr, err := payload.BuildPayload(hexSID, uuidSID, text, tone, gptOverride, false, hasTools, nil)
 		if err != nil {
+			logging.Errorf("ChatStreamGen: payload build failed: %v", err)
 			ch <- StreamChunk{Error: err}
 			return
 		}
 
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(payloadStr+signalRDelimiter)); err != nil {
+			logging.Errorf("ChatStreamGen: write failed: %v", err)
 			ch <- StreamChunk{Error: err}
 			return
 		}
+		logging.Debug("ChatStreamGen: payload sent, waiting for response")
 
 		sentText := ""
 		seenImages := map[string]bool{}
@@ -286,8 +303,10 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 			msgType, message, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsCloseError(err) || websocket.IsUnexpectedCloseError(err) {
+					logging.Warnf("ChatStreamGen: connection closed: %v", err)
 					ch <- StreamChunk{Error: ErrConnectionClosed}
 				} else {
+					logging.Errorf("ChatStreamGen: read error: %v", err)
 					ch <- StreamChunk{Error: err}
 				}
 				return
@@ -315,7 +334,7 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 				// DEBUG: log every WebSocket message type and target
 				if mt, ok := data["type"].(float64); ok {
 					target, _ := data["target"].(string)
-					log.Printf("DEBUG ConvWS raw: type=%d target=%s", int(mt), target)
+					logging.Debugf("ConvWS raw: type=%d target=%s", int(mt), target)
 				}
 				if msgType, ok := data["type"].(float64); ok && int(msgType) == 1 {
 					if target, ok := data["target"].(string); ok && target == "update" {
@@ -340,7 +359,7 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 											if msgMap, ok := msg.(map[string]interface{}); ok {
 												mt, _ := msgMap["messageType"].(string)
 												co, _ := msgMap["contentOrigin"].(string)
-												log.Printf("DEBUG WS msg: messageType=%s contentOrigin=%s keys=%v", mt, co, mapKeys(msgMap))
+												logging.Debugf("WS msg: messageType=%s contentOrigin=%s keys=%v", mt, co, mapKeys(msgMap))
 											}
 										}
 										// Scan all messages for thinking and image generation (Progress messages)
@@ -399,6 +418,7 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 						}
 					}
 				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == 3 {
+					logging.Debug("ChatStreamGen: received type=3 completion")
 					ch <- StreamChunk{Text: "", IsFinal: true}
 					return
 				}
@@ -412,6 +432,7 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 // ChatConversation sends a conversation with history and returns the response.
 // When hasTools is true, code_interpreter option flags are stripped from the payload.
 func (c *M365Client) ChatConversation(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, string, []ToolCall, string, error) {
+	logging.Infof("ChatConversation: tone=%s override=%s convID=%s hasTools=%v msgs=%d", tone, gptOverride, conversationID, hasTools, len(messages))
 	ch := c.ChatConversationStreamGen(messages, tone, gptOverride, conversationID, userOID, tenantID, hasTools)
 
 	for chunk := range ch {
@@ -441,6 +462,7 @@ type ConversationStreamChunk struct {
 // ChatConversationStreamGen generates a stream of conversation response chunks.
 // When hasTools is true, code_interpreter option flags are stripped from the payload.
 func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) <-chan ConversationStreamChunk {
+	logging.Infof("ChatConversationStreamGen: tone=%s override=%s convID=%s hasTools=%v msgs=%d", tone, gptOverride, conversationID, hasTools, len(messages))
 	ch := make(chan ConversationStreamChunk)
 
 	go func() {
@@ -451,6 +473,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 
 		conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
 		if err != nil {
+			logging.Errorf("ChatConversationStreamGen: dial failed: %v", err)
 			ch <- ConversationStreamChunk{Error: err}
 			return
 		}
@@ -458,14 +481,17 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 
 		payloadStr, err := payload.BuildConversationPayload(hexSID, uuidSID, messages, tone, gptOverride, false, hasTools, nil)
 		if err != nil {
+			logging.Errorf("ChatConversationStreamGen: payload build failed: %v", err)
 			ch <- ConversationStreamChunk{Error: err}
 			return
 		}
 
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(payloadStr+signalRDelimiter)); err != nil {
+			logging.Errorf("ChatConversationStreamGen: write failed: %v", err)
 			ch <- ConversationStreamChunk{Error: err}
 			return
 		}
+		logging.Debug("ChatConversationStreamGen: payload sent, waiting for response")
 
 		toolCalls := []ToolCall{}
 		seenImages := map[string]bool{}
@@ -480,8 +506,10 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 			msgType, message, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsCloseError(err) || websocket.IsUnexpectedCloseError(err) {
+					logging.Warnf("ChatConversationStreamGen: connection closed: %v", err)
 					ch <- ConversationStreamChunk{Error: ErrConnectionClosed}
 				} else {
+					logging.Errorf("ChatConversationStreamGen: read error: %v", err)
 					ch <- ConversationStreamChunk{Error: err}
 				}
 				return
@@ -510,7 +538,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 				// DEBUG: log every WebSocket message type and target (ConvStream)
 				if mt, ok := data["type"].(float64); ok {
 					target, _ := data["target"].(string)
-					log.Printf("DEBUG ConvStream raw: type=%d target=%s", int(mt), target)
+					logging.Debugf("ConvStream raw: type=%d target=%s", int(mt), target)
 				}
 				// DEBUG: log type=6 message content
 				if mt, ok := data["type"].(float64); ok && int(mt) == 6 {
@@ -519,7 +547,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 					if len(s) > 3000 {
 						s = s[:3000] + "...(truncated)"
 					}
-					log.Printf("DEBUG ConvStream type=6: %s", s)
+					logging.Debugf("ConvStream type=6: %s", s)
 				}
 				if msgType, ok := data["type"].(float64); ok && int(msgType) == 1 {
 					if target, ok := data["target"].(string); ok && target == "update" {
@@ -527,7 +555,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 							for _, arg := range args {
 								if argMap, ok := arg.(map[string]interface{}); ok {
 									// DEBUG: log all keys in argMap
-									log.Printf("DEBUG ConvStream argMap keys: %v", mapKeys(argMap))
+									logging.Debugf("ConvStream argMap keys: %v", mapKeys(argMap))
 									// Extract conversationId from type:1 update if present (rare)
 									if convID, ok := argMap["conversationId"].(string); ok && convID != "" {
 										c.connMutex.Lock()
@@ -540,7 +568,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 											if msgMap, ok := msg.(map[string]interface{}); ok {
 												mt, _ := msgMap["messageType"].(string)
 												co, _ := msgMap["contentOrigin"].(string)
-												log.Printf("DEBUG ConvWS msg: messageType=%s contentOrigin=%s keys=%v", mt, co, mapKeys(msgMap))
+												logging.Debugf("ConvWS msg: messageType=%s contentOrigin=%s keys=%v", mt, co, mapKeys(msgMap))
 											}
 										}
 										// Check all messages for tool calls and thinking
@@ -636,9 +664,11 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 						c.lastFinishReason = "stop"
 					}
 					c.connMutex.Unlock()
+					logging.Infof("ChatConversationStreamGen: completed finishReason=%s toolCalls=%d", c.lastFinishReason, len(toolCalls))
 					ch <- ConversationStreamChunk{Text: "", IsFinal: true}
 					return
 				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == -1 {
+					logging.Errorf("ChatConversationStreamGen: server error: %v", data)
 					ch <- ConversationStreamChunk{Error: fmt.Errorf("server error: %v", data)}
 					return
 				}
@@ -652,6 +682,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 // sendRecv sends a payload and waits for the complete response.
 func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, error) {
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload+signalRDelimiter)); err != nil {
+		logging.Errorf("sendRecv: write failed: %v", err)
 		return "", err
 	}
 
@@ -661,6 +692,7 @@ func (c *M365Client) sendRecv(conn *websocket.Conn, payload string) (string, err
 		conn.SetReadDeadline(time.Now().Add(c.recvTimeout))
 		msgType, message, err := conn.ReadMessage()
 		if err != nil {
+			logging.Errorf("sendRecv: read error: %v", err)
 			return "", err
 		}
 		conn.SetReadDeadline(time.Time{})
@@ -851,7 +883,7 @@ func extractImageGenerationMarkdown(msg map[string]interface{}, seenImages map[s
 			if len(s) > 2000 {
 				s = s[:2000] + "...(truncated)"
 			}
-			log.Printf("DEBUG ImageGen progress item JSON: %s", s)
+			logging.Debugf("ImageGen progress item JSON: %s", s)
 		}
 		urls, ok := itemMap["ImageReferenceUrls"].([]interface{})
 		if !ok {
@@ -866,6 +898,7 @@ func extractImageGenerationMarkdown(msg map[string]interface{}, seenImages map[s
 				continue
 			}
 			seenImages[url] = true
+			logging.Infof("ImageGen: extracted image URL: %s", url)
 			parts = append(parts, fmt.Sprintf("\n\n![image](%s)\n\n", url))
 		}
 	}

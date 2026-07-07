@@ -5,6 +5,8 @@ package models
 import (
 	"os"
 	"strings"
+
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 )
 
 // Version is the application version, shared across all binaries.
@@ -99,13 +101,16 @@ func LoadConfig() *Config {
 	// Load .env file if it exists
 	loadDotEnv()
 
-	return &Config{
+	cfg := &Config{
 		TenantID:        os.Getenv("M365_TENANT_ID"),
 		UserOID:         os.Getenv("M365_USER_OID"),
 		ClientID:        getEnvWithDefault("M365_CLIENT_ID", DefaultClientID),
 		Scope:           DefaultScope,
 		APIKeys:         parseAPIKeys(os.Getenv("M365_API_KEYS"), os.Getenv("M365_API_KEY")),
 	}
+
+	logging.Infof("LoadConfig: tenantID=%s userOID=%s clientID=%s apiKeys=%d", cfg.TenantID, cfg.UserOID, cfg.ClientID[:min(8, len(cfg.ClientID))]+"...", len(cfg.APIKeys))
+	return cfg
 }
 
 // parseAPIKeys builds the API key list from M365_API_KEYS (comma-separated)

@@ -6,12 +6,12 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/auth"
+	"github.com/KilimcininKorOglu/M365Bridge/pkg/logging"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/models"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/servers"
 	"github.com/KilimcininKorOglu/M365Bridge/pkg/setup"
@@ -27,6 +27,14 @@ const (
 )
 
 func main() {
+	// Initialize dual-writer logger (stdout + data/proxy.log)
+	if err := logging.Init(logging.LevelDebug); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer logging.Close()
+	logging.Infof("M365Bridge v%s starting", models.Version)
+
 	// Check for subcommand
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -58,7 +66,7 @@ func runServer(args []string) {
 	config := models.LoadConfig()
 
 	if config.TenantID == "" || config.UserOID == "" {
-		log.Fatalf("Error: M365_TENANT_ID and M365_USER_OID environment variables are required")
+		logging.Fatalf("Error: M365_TENANT_ID and M365_USER_OID environment variables are required")
 	}
 
 	tokenManager := auth.NewTokenManager(
@@ -84,13 +92,13 @@ func runServer(args []string) {
 
 	select {
 	case <-sigChan:
-		log.Println("Shutting down server...")
+		logging.Info("Shutting down server...")
 		if err := apiServer.Stop(); err != nil {
-			log.Printf("Error stopping server: %v", err)
+			logging.Errorf("Error stopping server: %v", err)
 		}
-		log.Println("Server stopped")
+		logging.Info("Server stopped")
 	case err := <-errChan:
-		log.Fatalf("Server error: %v", err)
+		logging.Fatalf("Server error: %v", err)
 	}
 }
 
