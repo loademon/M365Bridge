@@ -695,7 +695,7 @@ func (api *APIServer) handleAnthropicComplete(w http.ResponseWriter, r *http.Req
 
 // nonStreamAnthropicComplete handles non-streaming Anthropic complete (FIM) requests.
 func (api *APIServer) nonStreamAnthropicComplete(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, model string, maxTokens int, stopSequences []string, sid, convID string) {
-	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
 		return
@@ -729,8 +729,8 @@ func (api *APIServer) nonStreamAnthropicComplete(w http.ResponseWriter, messages
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -765,6 +765,8 @@ func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []
 	thinkingText := ""
 	truncated := false
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			errData := map[string]interface{}{
@@ -778,6 +780,8 @@ func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []
 		}
 
 		if chunk.IsFinal {
+			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -809,6 +813,7 @@ func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []
 		fmt.Fprintf(w, "event: completion\ndata: %s\n\n", compJSON)
 		flusher.Flush()
 	}
+	_ = finalToolCalls
 
 	// Determine stop reason
 	stopReason := "end_turn"
@@ -837,8 +842,8 @@ func (api *APIServer) streamAnthropicComplete(w http.ResponseWriter, messages []
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -872,6 +877,8 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	// text directly regardless of the global ToolCalling flag.
 	toolCallingEnabled := hasTools
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			api.sendSSEError(w, chunkID, openaiModel, chunk.Error)
@@ -879,6 +886,8 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 		}
 
 		if chunk.IsFinal {
+			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -960,9 +969,7 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 	}
 
 	// Send tool calls in stream if any (from M365 backend or simulated)
-	api.mu.RLock()
-	toolCalls := api.m365Client.LastToolCalls()
-	api.mu.RUnlock()
+	toolCalls := finalToolCalls
 
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
@@ -1029,15 +1036,15 @@ func (api *APIServer) streamChatCompletions(w http.ResponseWriter, messages []pa
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
 
 // nonStreamChatCompletions handles non-streaming chat completion in OpenAI format.
 func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
@@ -1141,8 +1148,8 @@ func (api *APIServer) nonStreamChatCompletions(w http.ResponseWriter, messages [
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -1192,6 +1199,8 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	toolCallingEnabled := hasTools
 	ch := api.m365Client.ChatConversationStreamGen(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			errEvent := map[string]interface{}{
@@ -1207,6 +1216,8 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 		}
 
 		if chunk.IsFinal {
+			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -1315,9 +1326,7 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 	}
 
 	// Send tool_use content blocks if any (server-side tools from M365 backend or simulated)
-	api.mu.RLock()
-	toolCalls := api.m365Client.LastToolCalls()
-	api.mu.RUnlock()
+	toolCalls := finalToolCalls
 
 	// In simulated mode, discard backend-injected tool calls (e.g.
 	// code_interpreter) — only client-declared tools parsed from the
@@ -1388,15 +1397,15 @@ func (api *APIServer) streamAnthropicMessages(w http.ResponseWriter, messages []
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
 
 // nonStreamAnthropicMessages handles non-streaming Anthropic messages response.
 func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, anthropicModel string, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
@@ -1492,8 +1501,8 @@ func (api *APIServer) nonStreamAnthropicMessages(w http.ResponseWriter, messages
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -1521,6 +1530,8 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 	truncated := false
 	toolCallingEnabled := hasTools
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			errChunk := map[string]interface{}{
@@ -1545,6 +1556,8 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 		}
 
 		if chunk.IsFinal {
+			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -1586,6 +1599,7 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 			flusher.Flush()
 		}
 	}
+	_ = finalToolCalls
 
 	// Parse simulated tool calls from buffered text if tool calling is enabled
 	var simToolCalls []toolcalling.ToolCall
@@ -1651,15 +1665,15 @@ func (api *APIServer) streamCompletions(w http.ResponseWriter, messages []payloa
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
 
 // nonStreamCompletions handles non-streaming text completion.
 func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, maxTokens int, sid, convID string, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Completion failed: %v", err))
 		return
@@ -1751,8 +1765,8 @@ func (api *APIServer) nonStreamCompletions(w http.ResponseWriter, messages []pay
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -2364,7 +2378,7 @@ func buildResponsesObject(responseID, model, text, thinking string, toolCalls []
 
 // nonStreamResponses handles non-streaming Responses API requests.
 func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, thinking, toolCalls, finishReason, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	respText, thinking, toolCalls, finishReason, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Chat failed: %v", err))
 		return
@@ -2418,8 +2432,8 @@ func (api *APIServer) nonStreamResponses(w http.ResponseWriter, messages []paylo
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -2483,6 +2497,8 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 	msgID := fmt.Sprintf("msg_%s", responseID)
 	reasoningID := fmt.Sprintf("rs_%s", responseID)
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			sendEvent("response.failed", map[string]interface{}{
@@ -2501,6 +2517,8 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 		}
 
 		if chunk.IsFinal {
+			finalConvID = chunk.ConversationID
+			finalToolCalls = chunk.ToolCalls
 			break
 		}
 
@@ -2611,6 +2629,7 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 			}
 		}
 	}
+	_ = finalToolCalls
 
 	// Finalize reasoning item if emitted
 	if reasoningItemEmitted && !toolCallingEnabled {
@@ -2843,8 +2862,8 @@ func (api *APIServer) streamResponses(w http.ResponseWriter, messages []payload.
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -2984,7 +3003,7 @@ func buildCompactionResponseObject(responseID, model, summaryText string, prompt
 
 // nonStreamResponsesCompact handles non-streaming compact requests.
 func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages []payload.Message, cfg models.ModelConfig, sid, convID string, maxTokens int, hasTools bool, tools []toolcalling.ToolDef) {
-	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
+	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, hasTools)
 	if err != nil {
 		logging.Errorf("nonStreamResponsesCompact: chat failed: %v", err)
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Compaction failed: %v", err))
@@ -3017,8 +3036,8 @@ func (api *APIServer) nonStreamResponsesCompact(w http.ResponseWriter, messages 
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -3073,6 +3092,8 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 
 	fullText := ""
 
+	var finalConvID string
+	var finalToolCalls []client.ToolCall
 	for chunk := range ch {
 		if chunk.Error != nil {
 			logging.Errorf("streamResponsesCompact: stream error: %v", chunk.Error)
@@ -3093,6 +3114,7 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 			fullText += chunk.Text
 		}
 	}
+	_ = finalToolCalls
 
 	// In simulated mode, extract plain content
 	if hasTools {
@@ -3143,8 +3165,8 @@ func (api *APIServer) streamResponsesCompact(w http.ResponseWriter, messages []p
 
 	// Cache conversation ID for session continuity
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 }
@@ -3237,7 +3259,7 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 
 	messages := []payload.Message{{Role: "user", Content: fullPrompt}}
 
-	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Image generation failed: %v", err))
 		return
@@ -3245,8 +3267,8 @@ func (api *APIServer) handleImageGenerations(w http.ResponseWriter, r *http.Requ
 
 	// Cache conversation ID
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 
@@ -3406,7 +3428,7 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 	// Upload images and attach annotations
 	api.uploadImagesAndAnnotate(&messages, convID)
 
-	respText, _, _, _, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
+	respText, _, _, _, finalConvID, err := api.m365Client.ChatConversation(messages, cfg.Tone, cfg.Override, convID, api.config.UserOID, api.config.TenantID, false)
 	if err != nil {
 		api.sendError(w, http.StatusInternalServerError, fmt.Sprintf("Image edit failed: %v", err))
 		return
@@ -3414,8 +3436,8 @@ func (api *APIServer) handleImageEdits(w http.ResponseWriter, r *http.Request) {
 
 	// Cache conversation ID
 	if sid != "" {
-		if convID := api.m365Client.LastConversationID(); convID != "" {
-			api.ctxCache.Set("session:"+sid, convID)
+		if finalConvID != "" {
+			api.ctxCache.Set("session:"+sid, finalConvID)
 		}
 	}
 

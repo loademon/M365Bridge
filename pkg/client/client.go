@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -57,23 +56,13 @@ type ToolCallFunction struct {
 }
 
 // M365Client handles WebSocket communication with M365 Copilot.
+// All state is per-request (carried via channel chunks), so the client
+// is safe for concurrent use without any mutex.
 type M365Client struct {
 	tokenManager      *auth.TokenManager
 	handshakeTimeout  time.Duration
 	recvTimeout       time.Duration
 	recvFinalTimeout  time.Duration
-
-	// requestMutex serializes requests to protect shared result state.
-	// Each request opens its own WebSocket connection (per-request model),
-	// but the result fields below are shared on the client instance.
-	requestMutex       sync.Mutex
-
-	lastToolCalls      []ToolCall
-	lastFinishReason   string
-	lastFullText       string
-	lastThinking       string
-	lastConversationID string
-	connMutex          sync.RWMutex
 }
 
 // NewM365Client creates a new M365 client instance.
@@ -258,10 +247,11 @@ func (c *M365Client) ChatStream(text, tone, gptOverride, conversationID, userOID
 
 // StreamChunk represents a chunk of streamed response.
 type StreamChunk struct {
-	Text     string
-	Thinking string
-	IsFinal  bool
-	Error    error
+	Text           string
+	Thinking       string
+	IsFinal        bool
+	Error          error
+	ConversationID string // set on final chunk
 }
 
 // ChatStreamGen generates a stream of response chunks.
@@ -297,6 +287,7 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 
 		sentText := ""
 		seenImages := map[string]bool{}
+		var finalConvID string
 
 		for {
 			conn.SetReadDeadline(time.Now().Add(c.recvTimeout))
@@ -343,9 +334,7 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 								if argMap, ok := arg.(map[string]interface{}); ok {
 									// Extract conversationId from type:1 update if present (rare)
 									if convID, ok := argMap["conversationId"].(string); ok && convID != "" {
-										c.connMutex.Lock()
-										c.lastConversationID = convID
-										c.connMutex.Unlock()
+										finalConvID = convID
 									}
 									// Handle writeAtCursor (delta text)
 									if writeAtCursor, ok := argMap["writeAtCursor"].(string); ok {
@@ -412,14 +401,12 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 					// type: 2 is invocation completion; contains item.conversationId
 					if item, ok := data["item"].(map[string]interface{}); ok {
 						if convID, ok := item["conversationId"].(string); ok && convID != "" {
-							c.connMutex.Lock()
-							c.lastConversationID = convID
-							c.connMutex.Unlock()
+							finalConvID = convID
 						}
 					}
 				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == 3 {
 					logging.Debug("ChatStreamGen: received type=3 completion")
-					ch <- StreamChunk{Text: "", IsFinal: true}
+					ch <- StreamChunk{Text: "", IsFinal: true, ConversationID: finalConvID}
 					return
 				}
 			}
@@ -431,32 +418,41 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 
 // ChatConversation sends a conversation with history and returns the response.
 // When hasTools is true, code_interpreter option flags are stripped from the payload.
-func (c *M365Client) ChatConversation(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, string, []ToolCall, string, error) {
+// Returns (text, thinking, toolCalls, finishReason, conversationID, error).
+func (c *M365Client) ChatConversation(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, string, []ToolCall, string, string, error) {
 	logging.Infof("ChatConversation: tone=%s override=%s convID=%s hasTools=%v msgs=%d", tone, gptOverride, conversationID, hasTools, len(messages))
 	ch := c.ChatConversationStreamGen(messages, tone, gptOverride, conversationID, userOID, tenantID, hasTools)
 
+	var fullText, thinking, convID string
+	var toolCalls []ToolCall
+	var finishReason string
+
 	for chunk := range ch {
 		if chunk.Error != nil {
-			return "", "", nil, "", chunk.Error
+			return "", "", nil, "", "", chunk.Error
+		}
+		if chunk.IsFinal {
+			convID = chunk.ConversationID
+			toolCalls = chunk.ToolCalls
+			finishReason = chunk.FinishReason
+		} else {
+			fullText += chunk.Text
+			thinking += chunk.Thinking
 		}
 	}
 
-	c.connMutex.RLock()
-	fullText := c.lastFullText
-	thinking := c.lastThinking
-	toolCalls := c.lastToolCalls
-	finishReason := c.lastFinishReason
-	c.connMutex.RUnlock()
-
-	return cleanText(fullText), thinking, toolCalls, finishReason, nil
+	return cleanText(fullText), thinking, toolCalls, finishReason, convID, nil
 }
 
 // ConversationStreamChunk represents a chunk of conversation stream.
 type ConversationStreamChunk struct {
-	Text     string
-	Thinking string
-	IsFinal  bool
-	Error    error
+	Text           string
+	Thinking       string
+	IsFinal        bool
+	Error          error
+	ConversationID string    // set on final chunk
+	ToolCalls      []ToolCall // set on final chunk
+	FinishReason   string    // set on final chunk
 }
 
 // ChatConversationStreamGen generates a stream of conversation response chunks.
@@ -467,9 +463,6 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 
 	go func() {
 		defer close(ch)
-
-		c.requestMutex.Lock()
-		defer c.requestMutex.Unlock()
 
 		conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
 		if err != nil {
@@ -495,11 +488,9 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 
 		toolCalls := []ToolCall{}
 		seenImages := map[string]bool{}
-
-		c.connMutex.Lock()
-		c.lastFullText = ""
-		c.lastThinking = ""
-		c.connMutex.Unlock()
+		accText := ""
+		accThinking := ""
+		var finalConvID string
 
 		for {
 			conn.SetReadDeadline(time.Now().Add(c.recvFinalTimeout))
@@ -558,9 +549,7 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 									logging.Debugf("ConvStream argMap keys: %v", mapKeys(argMap))
 									// Extract conversationId from type:1 update if present (rare)
 									if convID, ok := argMap["conversationId"].(string); ok && convID != "" {
-										c.connMutex.Lock()
-										c.lastConversationID = convID
-										c.connMutex.Unlock()
+										finalConvID = convID
 									}
 									if msgs, ok := argMap["messages"].([]interface{}); ok {
 										// DEBUG: log all messages' messageType and contentOrigin
@@ -584,18 +573,14 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 													if messageType == "Progress" {
 														if co, _ := msgMap["contentOrigin"].(string); co == "ChainOfThoughtSummary" {
 															if t, _ := msgMap["text"].(string); t != "" {
-																c.connMutex.Lock()
-																c.lastThinking += t
-																c.connMutex.Unlock()
+																accThinking += t
 																ch <- ConversationStreamChunk{Thinking: t, IsFinal: false}
 															}
 														}
 														// Extract generated image URLs from contentGenerationProgressList
 														if co, _ := msgMap["contentOrigin"].(string); co == "ImageGeneration" {
 															if imgMD := extractImageGenerationMarkdown(msgMap, seenImages); imgMD != "" {
-																c.connMutex.Lock()
-																c.lastFullText += imgMD
-																c.connMutex.Unlock()
+																accText += imgMD
 																ch <- ConversationStreamChunk{Text: imgMD, IsFinal: false}
 															}
 														}
@@ -617,30 +602,26 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 											if lastMsg, ok := msgs[len(msgs)-1].(map[string]interface{}); ok {
 												if lastMsgType, _ := lastMsg["messageType"].(string); lastMsgType != "Progress" {
 													if newText, ok := lastMsg["text"].(string); ok && newText != "" {
-														c.connMutex.Lock()
-														if newText != c.lastFullText {
+														if newText != accText {
 															var chunk string
-															if strings.HasPrefix(newText, c.lastFullText) {
-																chunk = newText[len(c.lastFullText):]
+															if strings.HasPrefix(newText, accText) {
+																chunk = newText[len(accText):]
 															} else {
 																chunk = newText
 															}
-															c.lastFullText = newText
+															accText = newText
 															if chunk != "" {
 																ch <- ConversationStreamChunk{Text: chunk, IsFinal: false}
 															}
 														}
-														c.connMutex.Unlock()
 													}
 												}
 											}
 										}
 									}
 									if writeAtCursor, ok := argMap["writeAtCursor"].(string); ok {
-										c.connMutex.Lock()
-										c.lastFullText += writeAtCursor
+										accText += writeAtCursor
 										ch <- ConversationStreamChunk{Text: writeAtCursor, IsFinal: false}
-										c.connMutex.Unlock()
 									}
 								}
 							}
@@ -650,22 +631,16 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 					// type: 2 is invocation completion; contains item.conversationId
 					if item, ok := data["item"].(map[string]interface{}); ok {
 						if convID, ok := item["conversationId"].(string); ok && convID != "" {
-							c.connMutex.Lock()
-							c.lastConversationID = convID
-							c.connMutex.Unlock()
+							finalConvID = convID
 						}
 					}
 				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == 3 {
-					c.connMutex.Lock()
-					c.lastToolCalls = toolCalls
+					finishReason := "stop"
 					if len(toolCalls) > 0 {
-						c.lastFinishReason = "tool_calls"
-					} else {
-						c.lastFinishReason = "stop"
+						finishReason = "tool_calls"
 					}
-					c.connMutex.Unlock()
-					logging.Infof("ChatConversationStreamGen: completed finishReason=%s toolCalls=%d", c.lastFinishReason, len(toolCalls))
-					ch <- ConversationStreamChunk{Text: "", IsFinal: true}
+					logging.Infof("ChatConversationStreamGen: completed finishReason=%s toolCalls=%d", finishReason, len(toolCalls))
+					ch <- ConversationStreamChunk{Text: "", IsFinal: true, ConversationID: finalConvID, ToolCalls: toolCalls, FinishReason: finishReason}
 					return
 				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == -1 {
 					logging.Errorf("ChatConversationStreamGen: server error: %v", data)
@@ -840,26 +815,7 @@ func cleanText(text string) string {
 	return strings.TrimSpace(cleaned)
 }
 
-// LastToolCalls returns the tool calls from the last conversation.
-func (c *M365Client) LastToolCalls() []ToolCall {
-	c.connMutex.RLock()
-	defer c.connMutex.RUnlock()
-	return c.lastToolCalls
-}
 
-// LastConversationID returns the conversation ID from the last response.
-func (c *M365Client) LastConversationID() string {
-	c.connMutex.RLock()
-	defer c.connMutex.RUnlock()
-	return c.lastConversationID
-}
-
-// LastThinking returns the thinking content from the last response.
-func (c *M365Client) LastThinking() string {
-	c.connMutex.RLock()
-	defer c.connMutex.RUnlock()
-	return c.lastThinking
-}
 
 // extractImageGenerationMarkdown extracts image URLs from a Progress message
 // with contentOrigin "ImageGeneration" and returns them as markdown image links.
