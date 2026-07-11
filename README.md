@@ -121,7 +121,8 @@ if (!oid) {
 }
 if (!oid || !tenant) return 'ERROR: No MSAL account found. Make sure you are logged in.';
 
-// 2. Install fetch interceptor to capture token response
+// 2. Install fetch interceptor to capture token response for the target client ID
+const targetClientID = '4765445b-32c6-49b0-83e6-1d93765276ca';
 const origFetch = window.fetch;
 let captured = false;
 window.fetch = async function(...args) {
@@ -129,20 +130,35 @@ window.fetch = async function(...args) {
   const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
   if (url.includes('oauth2/v2.0/token') && !captured) {
     try {
-      const clone = resp.clone();
-      const data = await clone.json();
-      if (data.refresh_token) {
-        captured = true;
-        const result = {oid, tenant, refresh_token: data.refresh_token};
-        try {
-          if (window.cookieStore) {
-            const cookies = await cookieStore.getAll();
-            const sso = cookies.filter(c => c.name === 'ESTSAUTH' || c.name === 'ESTSAUTHPERSISTENT');
-            if (sso.length > 0) result.sso_cookies = sso.map(c => ({name: c.name, value: c.value}));
-          }
-        } catch(e) {}
-        console.log('===== COPY THE COMPLETE JSON BELOW =====');
-        console.log(JSON.stringify(result, null, 2));
+      // Verify this request is for our target client ID
+      let bodyStr = '';
+      const init = args[1];
+      if (typeof init?.body === 'string') {
+        bodyStr = init.body;
+      } else if (init?.body instanceof URLSearchParams) {
+        bodyStr = init.body.toString();
+      } else if (init?.body instanceof ArrayBuffer || ArrayBuffer.isView(init?.body)) {
+        bodyStr = new TextDecoder().decode(init.body);
+      } else if (args[0] instanceof Request) {
+        bodyStr = await args[0].clone().text();
+      }
+      const isTarget = new URLSearchParams(bodyStr).get('client_id') === targetClientID;
+      if (isTarget) {
+        const clone = resp.clone();
+        const data = await clone.json();
+        if (data.refresh_token) {
+          captured = true;
+          const result = {oid, tenant, refresh_token: data.refresh_token};
+          try {
+            if (window.cookieStore) {
+              const cookies = await cookieStore.getAll();
+              const sso = cookies.filter(c => c.name === 'ESTSAUTH' || c.name === 'ESTSAUTHPERSISTENT');
+              if (sso.length > 0) result.sso_cookies = sso.map(c => ({name: c.name, value: c.value}));
+            }
+          } catch(e) {}
+          console.log('===== COPY THE COMPLETE JSON BELOW =====');
+          console.log(JSON.stringify(result, null, 2));
+        }
       }
     } catch(e) {}
   }
