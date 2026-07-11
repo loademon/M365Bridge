@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -43,8 +44,8 @@ type SSOCookie struct {
 
 // SSOCookieStore holds all SSO cookies needed for silent re-authentication.
 type SSOCookieStore struct {
-	Cookies   []SSOCookie `json:"cookies"`
-	CapturedAt time.Time  `json:"capturedAt"`
+	Cookies    []SSOCookie `json:"cookies"`
+	CapturedAt time.Time   `json:"capturedAt"`
 }
 
 // generatePKCE creates a PKCE code verifier and code challenge (S256).
@@ -64,7 +65,7 @@ func generatePKCE() (verifier, challenge string, err error) {
 // SaveSSOCookies encrypts and stores SSO cookies to disk.
 func SaveSSOCookies(cookies []SSOCookie) error {
 	store := SSOCookieStore{
-		Cookies:   cookies,
+		Cookies:    cookies,
 		CapturedAt: time.Now(),
 	}
 
@@ -391,6 +392,23 @@ type designerTokenCache struct {
 	ExpiresAt   int64  `json:"expires_at"`
 }
 
+// designerOAuthError represents an OAuth error returned by the broker token endpoint.
+type designerOAuthError struct {
+	Status      int
+	Code        string
+	Description string
+}
+
+// Error returns the broker OAuth error details.
+func (e *designerOAuthError) Error() string {
+	return fmt.Sprintf("designer broker token status %d: %s: %s", e.Status, e.Code, e.Description)
+}
+
+// isExpiredRefreshToken reports whether the broker refresh token must be replaced.
+func (e *designerOAuthError) isExpiredRefreshToken() bool {
+	return e.Code == "invalid_grant" && strings.Contains(e.Description, "AADSTS700084")
+}
+
 // GetDesignerToken returns a valid designerapp access token, acquiring a new
 // one via the broker refresh token flow if the cached token is expired or
 // missing. Falls back to SSO cookie broker authorize flow if no broker
@@ -433,20 +451,44 @@ func (tm *TokenManager) GetDesignerToken() (string, error) {
 // Uses a broker-compatible refresh token (stored in rt_broker.txt). If none
 // exists, falls back to SSO cookie broker authorize flow to obtain one.
 func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
-	// Try broker refresh token first
+	requestToken := tm.requestDesignerToken
+	if tm.designerTokenRequest != nil {
+		requestToken = tm.designerTokenRequest
+	}
+	acquireBrokerToken := tm.acquireBrokerRefreshTokenViaSSO
+	if tm.brokerTokenAcquisition != nil {
+		acquireBrokerToken = tm.brokerTokenAcquisition
+	}
+
 	refreshToken, err := tm.readBrokerRefreshToken()
 	if err != nil {
-		// No broker refresh token; acquire one via SSO cookies
 		logging.Info("acquireDesignerToken: no broker refresh token, acquiring via SSO cookies")
-		refreshToken, err = tm.acquireBrokerRefreshTokenViaSSO()
+		refreshToken, err = acquireBrokerToken()
 		if err != nil {
 			logging.Errorf("acquireDesignerToken: failed to acquire broker refresh token: %v", err)
 			return "", 0, fmt.Errorf("failed to acquire broker refresh token: %w", err)
 		}
-	} else {
-		logging.Debug("acquireDesignerToken: using existing broker refresh token")
+		return requestToken(refreshToken)
 	}
 
+	logging.Debug("acquireDesignerToken: using existing broker refresh token")
+	token, expiresIn, err := requestToken(refreshToken)
+	var oauthErr *designerOAuthError
+	if !errors.As(err, &oauthErr) || !oauthErr.isExpiredRefreshToken() {
+		return token, expiresIn, err
+	}
+
+	logging.Warn("acquireDesignerToken: broker refresh token expired, acquiring a new token via SSO cookies")
+	refreshToken, err = acquireBrokerToken()
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to reacquire expired broker refresh token: %w", err)
+	}
+
+	return requestToken(refreshToken)
+}
+
+// requestDesignerToken exchanges a broker refresh token for a designer access token.
+func (tm *TokenManager) requestDesignerToken(refreshToken string) (string, int, error) {
 	// Build the broker token URL with query parameters
 	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token?brk_client_id=%s&brk_redirect_uri=%s&client_id=%s&client-request-id=%s",
 		tm.tenant,
@@ -458,17 +500,17 @@ func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
 
 	// Build the request body matching MSAL.js broker flow
 	body := url.Values{
-		"client_id":                {brokerClientID},
-		"redirect_uri":             {designerBrokerRedirectURI},
-		"scope":                    {designerBrokerScope},
-		"grant_type":               {"refresh_token"},
-		"client_info":              {"1"},
-		"x-client-SKU":             {"msal.js.browser"},
-		"x-client-VER":             {"5.9.0"},
-		"x-ms-lib-capability":      {"retry-after, h429"},
+		"client_id":                  {brokerClientID},
+		"redirect_uri":               {designerBrokerRedirectURI},
+		"scope":                      {designerBrokerScope},
+		"grant_type":                 {"refresh_token"},
+		"client_info":                {"1"},
+		"x-client-SKU":               {"msal.js.browser"},
+		"x-client-VER":               {"5.9.0"},
+		"x-ms-lib-capability":        {"retry-after, h429"},
 		"x-client-current-telemetry": {"5|61,0,,,|,"},
 		"x-client-last-telemetry":    {"5|0|||0,0"},
-		"refresh_token":            {refreshToken},
+		"refresh_token":              {refreshToken},
 	}
 
 	// X-AnchorMailbox helps AAD route the request to the correct token service
@@ -503,6 +545,17 @@ func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		var oauthResult struct {
+			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
+		}
+		if err := json.Unmarshal(respBody, &oauthResult); err == nil && oauthResult.Error != "" {
+			return "", 0, &designerOAuthError{
+				Status:      resp.StatusCode,
+				Code:        oauthResult.Error,
+				Description: oauthResult.ErrorDescription,
+			}
+		}
 		return "", 0, fmt.Errorf("designer broker token status %d: %s", resp.StatusCode, string(respBody)[:min(300, len(respBody))])
 	}
 
@@ -517,7 +570,9 @@ func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
 
 	// Save rotated broker refresh token if returned
 	if result.RefreshToken != "" {
-		tm.writeBrokerRefreshToken(result.RefreshToken)
+		if err := tm.writeBrokerRefreshToken(result.RefreshToken); err != nil {
+			return "", 0, fmt.Errorf("failed to save rotated broker refresh token: %w", err)
+		}
 	}
 
 	return result.AccessToken, result.ExpiresIn, nil
@@ -636,15 +691,15 @@ func (tm *TokenManager) exchangeBrokerAuthCode(authCode, verifier string) (strin
 	)
 
 	body := url.Values{
-		"client_id":         {brokerClientID},
-		"redirect_uri":      {designerBrokerRedirectURI},
-		"scope":             {designerBrokerScope},
-		"grant_type":        {"authorization_code"},
-		"code":              {authCode},
-		"code_verifier":     {verifier},
-		"client_info":       {"1"},
-		"brk_client_id":     {designerClientID},
-		"brk_redirect_uri":  {defaultRedirectURI},
+		"client_id":        {brokerClientID},
+		"redirect_uri":     {designerBrokerRedirectURI},
+		"scope":            {designerBrokerScope},
+		"grant_type":       {"authorization_code"},
+		"code":             {authCode},
+		"code_verifier":    {verifier},
+		"client_info":      {"1"},
+		"brk_client_id":    {designerClientID},
+		"brk_redirect_uri": {defaultRedirectURI},
 	}
 
 	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(body.Encode()))
