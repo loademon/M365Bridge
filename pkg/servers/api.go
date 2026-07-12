@@ -2390,7 +2390,7 @@ func (api *APIServer) sendAnthropicSSE(w http.ResponseWriter, eventType string, 
 func (api *APIServer) uploadImagesAndAnnotate(messages *[]payload.Message, convID string) {
 	// Find the last message with images
 	lastImgIdx := -1
-	for i := len(*messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(*messages) {
 		if len((*messages)[i].Images) > 0 {
 			lastImgIdx = i
 			break
@@ -2459,7 +2459,7 @@ func chatAnthropicThinkingForOutput(thinking string, simulated bool) string {
 
 	var output []string
 	inFence := false
-	for _, line := range strings.Split(thinking, "\n") {
+	for line := range strings.SplitSeq(thinking, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "```") {
 			inFence = !inFence
@@ -2482,7 +2482,7 @@ func injectSimulatedPrompt(messages *[]payload.Message, requestJSON, toolChoice 
 		return
 	}
 	prompt := toolcalling.BuildSimulatedPrompt(requestJSON, true, toolChoice)
-	for i := len(*messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(*messages) {
 		if (*messages)[i].Role == "user" {
 			suffix := ""
 			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
@@ -2516,7 +2516,7 @@ func injectSimulatedPromptAnthropic(messages *[]payload.Message, requestJSON, to
 		return
 	}
 	prompt := toolcalling.BuildSimulatedPromptAnthropic(requestJSON, true, toolChoice)
-	for i := len(*messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(*messages) {
 		if (*messages)[i].Role == "user" {
 			suffix := ""
 			if currentUserMessage := strings.TrimSpace((*messages)[i].Content); currentUserMessage != "" {
@@ -2944,7 +2944,7 @@ func responsesSimulationRetryMessages(
 	}
 
 	retried := append([]payload.Message(nil), messages...)
-	for index := len(retried) - 1; index >= 0; index-- {
+	for index := range slices.Backward(retried) {
 		if retried[index].Role == "user" {
 			retried[index].Content += "\n\n" + retryInstruction
 			return retried
