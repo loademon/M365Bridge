@@ -2891,15 +2891,21 @@ func parseResponsesSimulationWithRetry(
 		return result, err
 	}
 
-	retryText, retryErr := retry()
-	if retryErr != nil {
-		return responsesSimulationResult{}, fmt.Errorf(
-			"%w: retry failed: %v",
-			errSimulatedToolCallRequired,
-			retryErr,
-		)
+	for attempt := 0; attempt < 2; attempt++ {
+		retryText, retryErr := retry()
+		if retryErr != nil {
+			return responsesSimulationResult{}, fmt.Errorf(
+				"%w: retry failed: %v",
+				errSimulatedToolCallRequired,
+				retryErr,
+			)
+		}
+		result, err = parseResponsesSimulation(retryText, policy)
+		if err == nil || !errors.Is(err, errSimulatedToolCallRequired) {
+			return result, err
+		}
 	}
-	return parseResponsesSimulation(retryText, policy)
+	return result, err
 }
 
 func responsesSimulationRetryMessages(
