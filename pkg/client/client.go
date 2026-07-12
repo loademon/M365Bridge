@@ -4,6 +4,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -52,6 +53,7 @@ type ToolCall struct {
 // ToolCallFunction represents the function part of a tool call.
 type ToolCallFunction struct {
 	Name      string `json:"name"`
+	Namespace string `json:"namespace,omitempty"`
 	Arguments string `json:"arguments"`
 }
 
@@ -268,8 +270,37 @@ func (c *M365Client) ChatStreamGen(text, tone, gptOverride, conversationID, user
 // When hasTools is true, code_interpreter option flags are stripped from the payload.
 // Returns (text, thinking, toolCalls, finishReason, conversationID, error).
 func (c *M365Client) ChatConversation(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) (string, string, []ToolCall, string, string, error) {
+	return c.ChatConversationContext(
+		context.Background(),
+		messages,
+		tone,
+		gptOverride,
+		conversationID,
+		userOID,
+		tenantID,
+		hasTools,
+	)
+}
+
+// ChatConversationContext sends a conversation and stops waiting when ctx is
+// canceled.
+func (c *M365Client) ChatConversationContext(
+	ctx context.Context,
+	messages []payload.Message,
+	tone, gptOverride, conversationID, userOID, tenantID string,
+	hasTools bool,
+) (string, string, []ToolCall, string, string, error) {
 	logging.Infof("ChatConversation: tone=%s override=%s convID=%s hasTools=%v msgs=%d", tone, gptOverride, conversationID, hasTools, len(messages))
-	ch := c.ChatConversationStreamGen(messages, tone, gptOverride, conversationID, userOID, tenantID, hasTools)
+	ch := c.ChatConversationStreamGenContext(
+		ctx,
+		messages,
+		tone,
+		gptOverride,
+		conversationID,
+		userOID,
+		tenantID,
+		hasTools,
+	)
 
 	var fullText, thinking, convID string
 	var toolCalls []ToolCall
@@ -289,36 +320,95 @@ func (c *M365Client) ChatConversation(messages []payload.Message, tone, gptOverr
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return "", "", nil, "", "", err
+	}
 	return cleanText(fullText), thinking, toolCalls, finishReason, convID, nil
 }
 
 // ChatConversationStreamGen generates a stream of conversation response chunks.
 // When hasTools is true, code_interpreter option flags are stripped from the payload.
 func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone, gptOverride, conversationID, userOID, tenantID string, hasTools bool) <-chan StreamChunk {
+	return c.ChatConversationStreamGenContext(
+		context.Background(),
+		messages,
+		tone,
+		gptOverride,
+		conversationID,
+		userOID,
+		tenantID,
+		hasTools,
+	)
+}
+
+// ChatConversationStreamGenContext generates a stream that stops when ctx is
+// canceled. This lets HTTP handlers release the upstream WebSocket as soon as
+// their client disconnects or a proxy timeout expires.
+func (c *M365Client) ChatConversationStreamGenContext(
+	ctx context.Context,
+	messages []payload.Message,
+	tone, gptOverride, conversationID, userOID, tenantID string,
+	hasTools bool,
+) <-chan StreamChunk {
 	logging.Infof("ChatConversationStreamGen: tone=%s override=%s convID=%s hasTools=%v msgs=%d", tone, gptOverride, conversationID, hasTools, len(messages))
 	ch := make(chan StreamChunk)
 
 	go func() {
 		defer close(ch)
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		emit := func(chunk StreamChunk) bool {
+			select {
+			case ch <- chunk:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
 
 		conn, hexSID, uuidSID, err := c.dialConnection(conversationID, userOID, tenantID)
 		if err != nil {
 			logging.Errorf("ChatConversationStreamGen: dial failed: %v", err)
-			ch <- StreamChunk{Error: err}
+			if ctx.Err() == nil {
+				emit(StreamChunk{Error: err})
+			}
 			return
 		}
 		defer conn.Close()
+		contextWatchDone := make(chan struct{})
+		defer close(contextWatchDone)
+		go func() {
+			select {
+			case <-ctx.Done():
+				conn.Close()
+			case <-contextWatchDone:
+			}
+		}()
 
-		payloadStr, err := payload.BuildConversationPayload(hexSID, uuidSID, messages, tone, gptOverride, false, hasTools, nil)
+		payloadStr, err := payload.BuildConversationPayload(
+			hexSID,
+			uuidSID,
+			messages,
+			conversationID == "",
+			tone,
+			gptOverride,
+			false,
+			hasTools,
+			nil,
+		)
 		if err != nil {
 			logging.Errorf("ChatConversationStreamGen: payload build failed: %v", err)
-			ch <- StreamChunk{Error: err}
+			emit(StreamChunk{Error: err})
 			return
 		}
 
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(payloadStr+signalRDelimiter)); err != nil {
 			logging.Errorf("ChatConversationStreamGen: write failed: %v", err)
-			ch <- StreamChunk{Error: err}
+			emit(StreamChunk{Error: err})
 			return
 		}
 		logging.Debug("ChatConversationStreamGen: payload sent, waiting for response")
@@ -333,12 +423,15 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 			conn.SetReadDeadline(time.Now().Add(c.recvFinalTimeout))
 			msgType, message, err := conn.ReadMessage()
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				if websocket.IsCloseError(err) || websocket.IsUnexpectedCloseError(err) {
 					logging.Warnf("ChatConversationStreamGen: connection closed: %v", err)
-					ch <- StreamChunk{Error: ErrConnectionClosed}
+					emit(StreamChunk{Error: ErrConnectionClosed})
 				} else {
 					logging.Errorf("ChatConversationStreamGen: read error: %v", err)
-					ch <- StreamChunk{Error: err}
+					emit(StreamChunk{Error: err})
 				}
 				return
 			}
@@ -410,14 +503,18 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 														if co, _ := msgMap["contentOrigin"].(string); co == "ChainOfThoughtSummary" {
 															if t, _ := msgMap["text"].(string); t != "" {
 																accThinking += t
-																ch <- StreamChunk{Thinking: t, IsFinal: false}
+																if !emit(StreamChunk{Thinking: t, IsFinal: false}) {
+																	return
+																}
 															}
 														}
 														// Extract generated image URLs from contentGenerationProgressList
 														if co, _ := msgMap["contentOrigin"].(string); co == "ImageGeneration" {
 															if imgMD := extractImageGenerationMarkdown(msgMap, seenImages); imgMD != "" {
 																accText += imgMD
-																ch <- StreamChunk{Text: imgMD, IsFinal: false}
+																if !emit(StreamChunk{Text: imgMD, IsFinal: false}) {
+																	return
+																}
 															}
 														}
 														// Extract web search tool calls from searchQueries field
@@ -447,7 +544,9 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 															}
 															accText = newText
 															if chunk != "" {
-																ch <- StreamChunk{Text: chunk, IsFinal: false}
+																if !emit(StreamChunk{Text: chunk, IsFinal: false}) {
+																	return
+																}
 															}
 														}
 													}
@@ -457,7 +556,9 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 									}
 									if writeAtCursor, ok := argMap["writeAtCursor"].(string); ok {
 										accText += writeAtCursor
-										ch <- StreamChunk{Text: writeAtCursor, IsFinal: false}
+										if !emit(StreamChunk{Text: writeAtCursor, IsFinal: false}) {
+											return
+										}
 									}
 								}
 							}
@@ -476,11 +577,11 @@ func (c *M365Client) ChatConversationStreamGen(messages []payload.Message, tone,
 						finishReason = "tool_calls"
 					}
 					logging.Infof("ChatConversationStreamGen: completed finishReason=%s toolCalls=%d", finishReason, len(toolCalls))
-					ch <- StreamChunk{Text: "", IsFinal: true, ConversationID: finalConvID, ToolCalls: toolCalls, FinishReason: finishReason}
+					emit(StreamChunk{Text: "", IsFinal: true, ConversationID: finalConvID, ToolCalls: toolCalls, FinishReason: finishReason})
 					return
 				} else if msgType, ok := data["type"].(float64); ok && int(msgType) == -1 {
 					logging.Errorf("ChatConversationStreamGen: server error: %v", data)
-					ch <- StreamChunk{Error: fmt.Errorf("server error: %v", data)}
+					emit(StreamChunk{Error: fmt.Errorf("server error: %v", data)})
 					return
 				}
 			}
