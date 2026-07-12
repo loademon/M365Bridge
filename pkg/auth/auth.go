@@ -41,13 +41,15 @@ type TokenCache struct {
 
 // TokenManager handles OAuth2 token lifecycle management.
 type TokenManager struct {
-	tenant      string
-	clientID    string
-	scope       string
-	refreshFile string
-	cacheFile   string
-	tokenURL    string
-	userOID     string
+	tenant                 string
+	clientID               string
+	scope                  string
+	refreshFile            string
+	cacheFile              string
+	tokenURL               string
+	userOID                string
+	designerTokenRequest   func(string) (string, int, error)
+	brokerTokenAcquisition func() (string, error)
 }
 
 // NewTokenManager creates a new TokenManager instance.

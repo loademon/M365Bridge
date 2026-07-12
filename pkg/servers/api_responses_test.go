@@ -516,7 +516,7 @@ func TestResponsesInputPreservesToolSearchAndCompactionHistory(t *testing.T) {
 	}
 }
 
-func TestResponsesFunctionCallOutputBecomesAuthoritativeUserHistory(t *testing.T) {
+func TestResponsesFunctionCallOutputBecomesAuthoritativeToolHistory(t *testing.T) {
 	messages := responsesInputToMessages([]interface{}{
 		map[string]interface{}{
 			"type":    "function_call_output",
@@ -528,8 +528,11 @@ func TestResponsesFunctionCallOutputBecomesAuthoritativeUserHistory(t *testing.T
 	if len(messages) != 1 {
 		t.Fatalf("message count = %d", len(messages))
 	}
-	if messages[0].Role != "user" {
-		t.Fatalf("function result role = %q, want user", messages[0].Role)
+	if messages[0].Role != "tool" {
+		t.Fatalf("function result role = %q, want tool", messages[0].Role)
+	}
+	if messages[0].ToolCallID != "call_nonce" {
+		t.Fatalf("function result call id = %q, want call_nonce", messages[0].ToolCallID)
 	}
 	for _, expected := range []string{
 		"authoritative tool result",

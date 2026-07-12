@@ -45,9 +45,13 @@ func BuildSimulatedPrompt(requestJSON string, hasTools bool, toolChoice string) 
 			"NEVER emit a tool_calls entry with name \"code_interpreter\" or any name not present in the request's tools array.",
 			"Do not use code_interpreter, web_search, or any built-in/baked-in tool. Only the client-supplied tools are valid.",
 		)
-		switch strings.ToLower(strings.TrimSpace(toolChoice)) {
+		normalizedChoice := strings.TrimSpace(toolChoice)
+		switch strings.ToLower(normalizedChoice) {
 		case "required":
 			lines = append(lines, "This request requires at least one tool call. Do not return a plain-text-only assistant response.")
+		case "", "auto", "none":
+		default:
+			lines = append(lines, fmt.Sprintf("This request requires a call to the tool named %q. Do not return a plain-text-only assistant response.", normalizedChoice))
 		}
 	}
 
@@ -182,10 +186,10 @@ func parseSimulatedResponse(text string, allowedToolNames []string, preserveTool
 	}
 
 	logging.Debugf("ParseSimulatedResponse: found %d JSON candidates, allowedTools=%v", len(candidates), allowedToolNames)
-	var best map[string]interface{}
+	var best map[string]any
 	bestScore := -1 << 30
 	for _, raw := range candidates {
-		var parsed map[string]interface{}
+		var parsed map[string]any
 		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 			continue
 		}
@@ -229,10 +233,10 @@ func ParseSimulatedResponseAnthropic(text string, allowedToolNames []string) Sim
 		return result
 	}
 
-	var best map[string]interface{}
+	var best map[string]any
 	bestScore := -1 << 30
 	for _, raw := range candidates {
-		var parsed map[string]interface{}
+		var parsed map[string]any
 		if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 			continue
 		}
@@ -254,7 +258,7 @@ func ParseSimulatedResponseAnthropic(text string, allowedToolNames []string) Sim
 // parseAnthropicPayload extracts tool_use blocks and text content from an
 // Anthropic message-shaped JSON object. Tool calls whose name is not in
 // `allowed` (when non-empty) are dropped.
-func parseAnthropicPayload(payload map[string]interface{}, result *SimulatedResult, allowed map[string]bool) {
+func parseAnthropicPayload(payload map[string]any, result *SimulatedResult, allowed map[string]bool) {
 	// stop_reason
 	if sr, ok := payload["stop_reason"].(string); ok && sr != "" {
 		if sr == "tool_use" {
@@ -264,7 +268,7 @@ func parseAnthropicPayload(payload map[string]interface{}, result *SimulatedResu
 		}
 	}
 
-	content, ok := payload["content"].([]interface{})
+	content, ok := payload["content"].([]any)
 	if !ok || len(content) == 0 {
 		// Some models put text directly in a "text" field
 		if t, ok := payload["text"].(string); ok && t != "" {
@@ -275,7 +279,7 @@ func parseAnthropicPayload(payload map[string]interface{}, result *SimulatedResu
 
 	var textParts []string
 	for _, block := range content {
-		bm, ok := block.(map[string]interface{})
+		bm, ok := block.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -325,23 +329,24 @@ func parseAnthropicPayload(payload map[string]interface{}, result *SimulatedResu
 
 // scoreAnthropicCandidate scores a parsed JSON object by how much it resembles
 // an Anthropic Messages response. Higher is better; <=0 means unusable.
-func scoreAnthropicCandidate(candidate map[string]interface{}) int {
+func scoreAnthropicCandidate(candidate map[string]any) int {
 	score := 0
 	if isRequestLikeSimulatedPayload(candidate) {
 		score -= 180
 	}
 
 	// Anthropic response has "content" array, "role", "stop_reason", "type":"message"
-	content, hasContent := candidate["content"].([]interface{})
+	content, hasContent := candidate["content"].([]any)
 	if hasContent && len(content) > 0 {
 		score += 220
 		// Check for tool_use / text blocks
 		for _, block := range content {
-			if bm, ok := block.(map[string]interface{}); ok {
+			if bm, ok := block.(map[string]any); ok {
 				if bt, ok := bm["type"].(string); ok {
-					if bt == "tool_use" {
+					switch bt {
+					case "tool_use":
 						score += 90
-					} else if bt == "text" {
+					case "text":
 						if t, ok := bm["text"].(string); ok && strings.TrimSpace(t) != "" {
 							score += 35
 						}
@@ -365,7 +370,7 @@ func scoreAnthropicCandidate(candidate map[string]interface{}) int {
 	}
 
 	// Penalize OpenAI-shaped objects (choices array)
-	if _, ok := candidate["choices"].([]interface{}); ok {
+	if _, ok := candidate["choices"].([]any); ok {
 		score -= 100
 	}
 
@@ -376,12 +381,12 @@ func scoreAnthropicCandidate(candidate map[string]interface{}) int {
 // chat.completion-shaped JSON object into the result. Tool calls whose name is
 // not in `allowed` (when non-empty) are dropped — this strips M365-invented
 // tools like "code_interpreter" that the client never declared.
-func parseChatCompletionPayload(payload map[string]interface{}, result *SimulatedResult, allowed map[string]bool, preserveToolContent bool) {
-	choices, ok := payload["choices"].([]interface{})
+func parseChatCompletionPayload(payload map[string]any, result *SimulatedResult, allowed map[string]bool, preserveToolContent bool) {
+	choices, ok := payload["choices"].([]any)
 	if !ok || len(choices) == 0 {
 		return
 	}
-	first, ok := choices[0].(map[string]interface{})
+	first, ok := choices[0].(map[string]any)
 	if !ok {
 		return
 	}
@@ -390,14 +395,14 @@ func parseChatCompletionPayload(payload map[string]interface{}, result *Simulate
 		result.FinishReason = fr
 	}
 
-	message, ok := first["message"].(map[string]interface{})
+	message, ok := first["message"].(map[string]any)
 	if !ok {
 		return
 	}
 
-	if toolCallsNode, ok := message["tool_calls"].([]interface{}); ok && len(toolCallsNode) > 0 {
+	if toolCallsNode, ok := message["tool_calls"].([]any); ok && len(toolCallsNode) > 0 {
 		for _, tcNode := range toolCallsNode {
-			tc, ok := tcNode.(map[string]interface{})
+			tc, ok := tcNode.(map[string]any)
 			if !ok {
 				continue
 			}
@@ -438,8 +443,8 @@ func parseChatCompletionPayload(payload map[string]interface{}, result *Simulate
 // extractToolCallFields pulls id/name/arguments from a tool_calls entry,
 // tolerating both the OpenAI wrapper ({id,type,function:{name,arguments}})
 // and a flat shape ({name,arguments}).
-func extractToolCallFields(tc map[string]interface{}) (name, namespace, id, args string) {
-	if fn, ok := tc["function"].(map[string]interface{}); ok {
+func extractToolCallFields(tc map[string]any) (name, namespace, id, args string) {
+	if fn, ok := tc["function"].(map[string]any); ok {
 		if n, ok := fn["name"].(string); ok && n != "" {
 			name = n
 		}
@@ -478,7 +483,7 @@ func extractToolCallFields(tc map[string]interface{}) (name, namespace, id, args
 // normalizeArgumentsJSON ensures arguments is a JSON string value. If the node
 // is already a string, it is returned as-is (after light validation); if it is
 // an object/array, it is re-serialized; if missing, "{}" is returned.
-func normalizeArgumentsJSON(node interface{}) string {
+func normalizeArgumentsJSON(node any) string {
 	if node == nil {
 		return "{}"
 	}
@@ -488,7 +493,7 @@ func normalizeArgumentsJSON(node interface{}) string {
 			return "{}"
 		}
 		// Validate it parses; if not, return as-is (tolerance).
-		var probe interface{}
+		var probe any
 		if json.Unmarshal([]byte(trimmed), &probe) == nil {
 			return trimmed
 		}
@@ -503,21 +508,21 @@ func normalizeArgumentsJSON(node interface{}) string {
 
 // normalizeMessageContent flattens message.content (string or array of parts)
 // into a single string.
-func normalizeMessageContent(node interface{}) string {
+func normalizeMessageContent(node any) string {
 	if node == nil {
 		return ""
 	}
 	if s, ok := node.(string); ok {
 		return s
 	}
-	if arr, ok := node.([]interface{}); ok {
+	if arr, ok := node.([]any); ok {
 		var parts []string
 		for _, part := range arr {
 			if s, ok := part.(string); ok {
 				parts = append(parts, s)
 				continue
 			}
-			if m, ok := part.(map[string]interface{}); ok {
+			if m, ok := part.(map[string]any); ok {
 				if t, ok := m["text"].(string); ok {
 					parts = append(parts, t)
 				}
@@ -530,27 +535,27 @@ func normalizeMessageContent(node interface{}) string {
 
 // scoreSimulatedCandidate scores a parsed JSON object by how much it resembles
 // an OpenAI chat.completion response. Higher is better; <=0 means unusable.
-func scoreSimulatedCandidate(candidate map[string]interface{}) int {
+func scoreSimulatedCandidate(candidate map[string]any) int {
 	score := 0
 	if isRequestLikeSimulatedPayload(candidate) {
 		score -= 180
 	}
 
-	choices, ok := candidate["choices"].([]interface{})
+	choices, ok := candidate["choices"].([]any)
 	if ok && len(choices) > 0 {
 		score += 220
-		if first, ok := choices[0].(map[string]interface{}); ok {
-			if message, ok := first["message"].(map[string]interface{}); ok {
+		if first, ok := choices[0].(map[string]any); ok {
+			if message, ok := first["message"].(map[string]any); ok {
 				score += 80
 				if role, ok := message["role"].(string); ok && strings.ToLower(role) == "assistant" {
 					score += 20
 				}
-				if tc, ok := message["tool_calls"].([]interface{}); ok && len(tc) > 0 {
+				if tc, ok := message["tool_calls"].([]any); ok && len(tc) > 0 {
 					score += 90
 				}
 				if content, ok := message["content"].(string); ok && strings.TrimSpace(content) != "" {
 					score += 35
-				} else if arr, ok := message["content"].([]interface{}); ok && len(arr) > 0 {
+				} else if arr, ok := message["content"].([]any); ok && len(arr) > 0 {
 					score += 20
 				}
 			}
@@ -576,14 +581,14 @@ func scoreSimulatedCandidate(candidate map[string]interface{}) int {
 // isRequestLikeSimulatedPayload detects when a candidate is actually the echoed
 // request (has messages/input + tools/tool_choice) rather than a response, so
 // we can penalize it.
-func isRequestLikeSimulatedPayload(candidate map[string]interface{}) bool {
-	_, hasMessages := candidate["messages"].([]interface{})
+func isRequestLikeSimulatedPayload(candidate map[string]any) bool {
+	_, hasMessages := candidate["messages"].([]any)
 	_, hasInput := candidate["input"]
-	_, hasTools := candidate["tools"].([]interface{})
+	_, hasTools := candidate["tools"].([]any)
 	_, hasToolChoiceStr := candidate["tool_choice"].(string)
-	_, hasToolChoiceObj := candidate["tool_choice"].(map[string]interface{})
+	_, hasToolChoiceObj := candidate["tool_choice"].(map[string]any)
 	_, hasParallel := candidate["parallel_tool_calls"]
-	_, hasChoices := candidate["choices"].([]interface{})
+	_, hasChoices := candidate["choices"].([]any)
 	lacksResponseShape := !hasChoices
 
 	hasToolSignals := hasTools || hasToolChoiceStr || hasToolChoiceObj || hasParallel || lacksResponseShape
@@ -592,9 +597,9 @@ func isRequestLikeSimulatedPayload(candidate map[string]interface{}) bool {
 
 // looksLikeChatChoiceObject returns true if the candidate itself looks like a
 // single choice object (has message/delta/finish_reason).
-func looksLikeChatChoiceObject(candidate map[string]interface{}) bool {
-	_, hasMessage := candidate["message"].(map[string]interface{})
-	_, hasDelta := candidate["delta"].(map[string]interface{})
+func looksLikeChatChoiceObject(candidate map[string]any) bool {
+	_, hasMessage := candidate["message"].(map[string]any)
+	_, hasDelta := candidate["delta"].(map[string]any)
 	_, hasFinishReason := candidate["finish_reason"]
 	return hasMessage || hasDelta || hasFinishReason
 }

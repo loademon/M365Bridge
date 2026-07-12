@@ -102,89 +102,126 @@ The server needs a refresh token from your Microsoft 365 Copilot session. Extrac
 3. Paste and run the following JavaScript code:
 
 <details>
-<summary>Click to expand the JavaScript interceptor snippet</summary>
+<summary>Click to expand the JavaScript extraction snippet</summary>
 
 ```javascript
-(() => {
-const k = Object.keys(localStorage).find(k => k.startsWith('msal.') && k.includes('|'));
-if (!k) return 'NOT_FOUND';
-const p = k.split('|')[1].split('.');
-const oid = p[0], tenant = p[1];
+(async () => {
+// 1. Get oid/tenant
+let oid, tenant;
+for (const key of Object.keys(localStorage)) {
+  if (!key.includes('active-account-filters')) continue;
+  try {
+    const val = JSON.parse(localStorage.getItem(key));
+    if (val?.homeAccountId?.includes('.')) { [oid, tenant] = val.homeAccountId.split('.'); break; }
+  } catch(e) {}
+}
+if (!oid) {
+  const mk = Object.keys(localStorage).find(k => k.startsWith('msal.') && k.includes('|'));
+  if (mk) { const p = mk.split('|')[1]; if (p?.includes('.')) [oid, tenant] = p.split('.'); }
+}
+if (!oid || !tenant) return 'ERROR: No MSAL account found. Make sure you are logged in.';
 
+// 2. Install fetch interceptor to capture token response for the target client ID
+const targetClientID = '4765445b-32c6-49b0-83e6-1d93765276ca';
 const origFetch = window.fetch;
+let captured = false;
 window.fetch = async function(...args) {
   const resp = await origFetch.apply(this, args);
-  const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
-  if (url.includes('login.microsoftonline.com') && url.includes('oauth2/v2.0/token')) {
+  const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+  if (url.includes('oauth2/v2.0/token') && !captured) {
     try {
-      const clone = resp.clone();
-      const data = await clone.json();
-      if (data.refresh_token) {
-        console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-        console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
+      // Verify this request is for our target client ID
+      let bodyStr = '';
+      const init = args[1];
+      if (typeof init?.body === 'string') {
+        bodyStr = init.body;
+      } else if (init?.body instanceof URLSearchParams) {
+        bodyStr = init.body.toString();
+      } else if (init?.body instanceof ArrayBuffer || ArrayBuffer.isView(init?.body)) {
+        bodyStr = new TextDecoder().decode(init.body);
+      } else if (args[0] instanceof Request) {
+        bodyStr = await args[0].clone().text();
+      }
+      const isTarget = new URLSearchParams(bodyStr).get('client_id') === targetClientID;
+      if (isTarget) {
+        const clone = resp.clone();
+        const data = await clone.json();
+        if (data.refresh_token) {
+          captured = true;
+          const result = {oid, tenant, refresh_token: data.refresh_token};
+          try {
+            if (window.cookieStore) {
+              const cookies = await cookieStore.getAll();
+              const sso = cookies.filter(c => c.name === 'ESTSAUTH' || c.name === 'ESTSAUTHPERSISTENT');
+              if (sso.length > 0) result.sso_cookies = sso.map(c => ({name: c.name, value: c.value}));
+            }
+          } catch(e) {}
+          console.log('===== COPY THE COMPLETE JSON BELOW =====');
+          console.log(JSON.stringify(result, null, 2));
+        }
       }
     } catch(e) {}
   }
   return resp;
 };
 
-const origXHROpen = XMLHttpRequest.prototype.open;
-const origXHRSend = XMLHttpRequest.prototype.send;
-XMLHttpRequest.prototype.open = function(method, url) {
-  this._url = url;
-  return origXHROpen.apply(this, arguments);
-};
-XMLHttpRequest.prototype.send = function(body) {
-  this.addEventListener('load', function() {
-    if (this._url && this._url.includes('oauth2/v2.0/token')) {
-      try {
-        const data = JSON.parse(this.responseText);
-        if (data.refresh_token) {
-          console.log('===== COPY THE COMPLETE JSON LINE BELOW =====');
-          console.log(JSON.stringify({oid, tenant, refresh_token: data.refresh_token}));
-        }
-      } catch(e) {}
-    }
-  });
-  return origXHRSend.apply(this, arguments);
-};
-
-const keys = Object.keys(localStorage);
-let cleared = 0;
-for (const key of keys) {
-  if (key.includes('accesstoken') || key.includes('idtoken')) {
-    localStorage.removeItem(key);
-    cleared++;
-  }
-}
-
-window.dispatchEvent(new Event('load'));
-if (window.msal) {
+// 3. Find MSAL instance and force token refresh
+let msal = null;
+const checked = new WeakSet();
+function findMsal(obj, depth) {
+  if (!obj || depth > 3 || typeof obj !== 'object' || checked.has(obj)) return null;
+  checked.add(obj);
   try {
-    const accounts = window.msal.getAllAccounts();
-    if (accounts.length > 0) {
-      window.msal.acquireTokenSilent({
-        account: accounts[0],
-        scopes: ['https://substrate.office.com/sydney/.default']
-      }).catch(() => {});
+    if (typeof obj.acquireTokenSilent === 'function' && typeof obj.getAllAccounts === 'function') return obj;
+    if (depth < 3) for (const k of Object.keys(obj)) {
+      try { const r = findMsal(obj[k], depth + 1); if (r) return r; } catch(e) {}
     }
   } catch(e) {}
+  return null;
+}
+for (const k of Object.getOwnPropertyNames(window)) {
+  try { msal = findMsal(window[k], 0); if (msal) break; } catch(e) {}
 }
 
-return 'Interceptors installed and ' + cleared + ' access tokens cleared. MSAL should refresh automatically. Watch the console for the JSON output.';
+if (msal) {
+  const accounts = msal.getAllAccounts();
+  if (accounts.length > 0) {
+    try {
+      await msal.acquireTokenSilent({
+        account: accounts[0],
+        scopes: ['https://substrate.office.com/.default'],
+        forceRefresh: true
+      });
+    } catch(e) {}
+  }
+  return 'Token refresh triggered. Copy the JSON output above.';
+}
+return 'Interceptor installed but MSAL instance not found. Navigate within m365.cloud.microsoft to trigger a token refresh, then copy the JSON output.';
 })()
 ```
 
 </details>
 
-4. Watch the console for: `===== COPY THE COMPLETE JSON LINE BELOW =====`
-5. Copy the JSON output. It looks like this:
+4. The console will output: `===== COPY THE COMPLETE JSON BELOW =====`
+5. Copy the JSON output. It will look like this:
 
 ```json
-{"oid":"your-oid","tenant":"your-tenant","refresh_token":"your-refresh-token"}
+{
+  "oid": "your-oid",
+  "tenant": "your-tenant",
+  "refresh_token": "your-refresh-token",
+  "sso_cookies": [
+    {"name": "ESTSAUTH", "value": "..."},
+    {"name": "ESTSAUTHPERSISTENT", "value": "..."}
+  ]
+}
 ```
 
-#### Step 4 (Optional): Get SSO cookies for automatic renewal
+> **Note:** SSO cookies are captured automatically if the `cookieStore` API is available (Chrome, Edge). If `sso_cookies` is missing from the output, see Step 4 below.
+
+#### Step 4 (Optional): Get SSO cookies manually
+
+If the script above did not capture SSO cookies automatically (e.g. Firefox, or third-party cookie restrictions), capture them manually:
 
 Microsoft SPA refresh tokens expire after **24 hours**. Without SSO cookies, you must repeat Step 3 every 24 hours. SSO cookies enable automatic renewal and last weeks/months.
 
@@ -198,7 +235,7 @@ To capture SSO cookies:
 
 #### Step 5: Create setup.json
 
-Create a file at `data/setup.json` with the JSON from Step 3. If you captured SSO cookies in Step 4, add them to the `sso_cookies` array:
+Create a file at `data/setup.json` with the JSON from Step 3. If you captured SSO cookies manually in Step 4, add them to the `sso_cookies` array:
 
 **Without SSO cookies (must re-run setup every 24 hours):**
 
@@ -227,6 +264,7 @@ Run the setup wizard inside the container to encrypt and save your credentials:
 ```bash
 docker exec -it m365bridge ./bin/m365-bridge setup-wizard
 ```
+
 
 The wizard will:
 - Read `data/setup.json`
@@ -267,7 +305,7 @@ Then follow Steps 3-6 above.
 | Flag            | Type   | Default | Description                                                              |
 |-----------------|--------|---------|--------------------------------------------------------------------------|
 | `-i`            | bool   | false   | Interactive mode (multi-turn conversation)                               |
-| `--model`       | string | `auto`  | Model to use: `auto`, `quick`, `reasoning`, `gpt5.5`, `gpt5.5-reasoning` |
+| `--model`       | string | `auto`  | Model to use: `auto`, `quick`, `reasoning`, `gpt5.5`, `gpt5.5-reasoning`, `gpt5.6-reasoning`, `claude`, `claude-sonnet`, `claude-opus`, `claude-fable`, `claude-sonnet-4-20250514` |
 | `--reasoning`   | bool   | false   | Use reasoning mode                                                       |
 | `--no-stream`   | bool   | false   | Disable streaming, print full response at once                           |
 | `--list-models` | bool   | false   | List all available models and exit                                       |
@@ -434,15 +472,20 @@ print(resp.choices[0].message.content)
 | `POST /v1/responses`          | OpenAI Responses API (streaming + non-streaming)    |
 | `POST /v1/responses/compact`  | OpenAI Responses Compact API (Codex remote compaction) |
 | `POST /v1/messages`           | Anthropic Messages format (dedicated SSE handlers)  |
+| `POST /v1/messages/count_tokens` | Anthropic input token counting                   |
 | `POST /v1/complete`           | Anthropic Complete (FIM)                            |
 | `POST /v1/images/generations` | OpenAI Images API: generate from text (JSON body)   |
 | `POST /v1/images/edits`       | OpenAI Images API: edit existing image (multipart)  |
+| `GET /v1/conversations`       | List M365 conversations (requires M365 web cookies) |
+| `POST /v1/conversations`      | Create a conversation with an initial message       |
+| `PATCH /v1/conversations/{id}` | Rename a conversation with `{ "name": "..." }`  |
+| `DELETE /v1/conversations/{id}` | Permanently delete a conversation                  |
 | `GET /v1/models`              | Model list                                          |
 | `GET /health`                 | Health check (no auth required)                     |
 
 ## Models
 
-All model selection is via the `tone` field sent to the M365 backend. The `Override` field is empty for all models. GPT-5.x models route to the GPT-5 backend; Claude models route to real Anthropic Claude models (verified via tone test).
+All model selection is via the `tone` field sent to the M365 backend. The `Override` field is empty for all models. GPT-5.x models route to the GPT-5 backend. Claude tone values return Claude responses, but M365 does not expose the underlying model identity in SignalR metadata.
 
 | Key                        | Tone              | OpenAI ID         | Thinking? | Backend |
 |----------------------------|-------------------|-------------------|-----------|---------|
@@ -451,9 +494,11 @@ All model selection is via the `tone` field sent to the M365 backend. The `Overr
 | `reasoning`                | Magic             | gpt-4-reasoning   | No        | GPT-5   |
 | `gpt5.5`                   | Gpt_5_5_Chat      | gpt-5.5           | No        | GPT-5   |
 | `gpt5.5-reasoning`         | Gpt_5_5_Reasoning | gpt-5.5-reasoning | Yes       | GPT-5   |
+| `gpt5.6-reasoning`         | Gpt_5_6_Reasoning | gpt-5.6-reasoning | Yes       | GPT-5   |
 | `claude`                   | Claude_Sonnet     | claude-sonnet-4.6 | No        | Claude  |
 | `claude-sonnet`            | Claude_Sonnet     | claude-sonnet-4.6 | No        | Claude  |
 | `claude-opus`              | Claude_Opus       | claude-opus-4.6   | No        | Claude  |
+| `claude-fable`             | Claude_Fable      | claude-fable-5    | No        | Claude  |
 | `claude-sonnet-4-20250514` | Claude_Sonnet     | claude-sonnet-4.6 | No        | Claude  |
 
 ### Which model should I use?
@@ -463,10 +508,12 @@ All model selection is via the `tone` field sent to the M365 backend. The `Overr
 | General purpose, let backend decide          | `auto`             |
 | Fast responses, simple questions             | `quick`            |
 | Complex reasoning, multi-step problems       | `reasoning`        |
-| GPT-5.5 chat (latest conversational model)   | `gpt5.5`           |
-| GPT-5.5 with deep thinking (shows reasoning) | `gpt5.5-reasoning` |
+| GPT-5.5 chat                                 | `gpt5.5`           |
+| GPT-5.5 with deep thinking                   | `gpt5.5-reasoning` |
+| GPT-5.6 with deep thinking (latest)          | `gpt5.6-reasoning` |
 | Claude Sonnet 4.6 (Anthropic)                | `claude-sonnet`    |
 | Claude Opus 4.6 (Anthropic, most capable)    | `claude-opus`      |
+| Claude Fable tone                            | `claude-fable`     |
 
 `gpt5.5-reasoning` produces `reasoning_content` output containing the model's thinking process. OpenAI endpoints expose this as `reasoning_content`; Anthropic endpoints expose it as a `thinking` content block before the `text` block. Claude models do not produce reasoning content.
 
@@ -587,6 +634,51 @@ Response:
 - When M365 Copilot runs its own server-side tools (web search, code interpreter) and returns plain text instead of a simulated JSON payload, the response is returned as a normal text completion with `finish_reason: "stop"`.
 - `tool_result` messages (OpenAI) and `tool_use`/`tool_result` content blocks (Anthropic) in conversation history are converted to plain text before being sent to M365, since the M365 backend does not understand tool roles.
 - Streaming endpoints buffer the full response before parsing tool calls (tool call JSON may span multiple chunks).
+
+## Built-in Coding Tools (Opt-in)
+
+M365Bridge can execute a restricted set of local coding operations on the server. This feature is **disabled by default** and its main gate is `M365_ENABLE_CODE_TOOLS=1`. It is available on OpenAI Chat Completions (`/v1/chat/completions`), Anthropic Messages (`/v1/messages`), and OpenAI Responses (`/v1/responses`).
+
+When enabled, tools explicitly included in a request are recognized and executed locally. `M365_AUTO_EXPOSE_TOOLS=1` also adds all built-in tools to requests automatically; leave it at `0` when clients should select tools explicitly. The server sends local results back to the model and continues until the model returns a final answer, emits a caller-defined tool call, or reaches the iteration limit. Because tool calls and intermediate results must be collected first, requests using built-in tools buffer the complete model response even when `stream: true`, then emit the provider-compatible streaming response.
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `M365_ENABLE_CODE_TOOLS` | `0` | Main gate. Set to `1` to enable local tool execution. |
+| `M365_AUTO_EXPOSE_TOOLS` | `0` | Set to `1` to inject all built-in tool schemas when the client does not provide them. |
+| `M365_WORKSPACE_DIR` | `.` | Existing directory that confines file and Git operations. |
+| `M365_CODE_TOOL_TIMEOUT` | `30s` | Timeout for each command or test execution. Accepts Go duration syntax, such as `10s` or `2m`. |
+| `M365_CODE_TOOL_MAX_OUTPUT` | `1048576` | Maximum captured command output in bytes. Longer output is truncated. |
+| `M365_CODE_TOOL_MAX_READ_BYTES` | `1048576` | Maximum number of bytes returned by a file read. |
+| `M365_CODE_TOOL_MAX_ITERATIONS` | `10` | Maximum model/tool loop iterations per request. |
+
+Set these variables in `data/.env`. For Docker, `M365_WORKSPACE_DIR` must refer to a directory that already exists inside the container. The provided Compose file mounts only `./data` at `/app/data`; it does not expose a host source workspace.
+
+### Available Tools
+
+| Tool | Operation |
+|------|-----------|
+| `list_files` | List files and directories under a workspace path. |
+| `read_file` | Read a file, subject to the configured byte limit. |
+| `write_file` | Create or replace a file inside the workspace. |
+| `search_files` | Search workspace file contents. |
+| `git_status` | Show workspace Git status. |
+| `git_diff` | Show workspace Git changes. |
+| `git_log` | Show recent workspace Git history. |
+| `shell_command` | Run a shell command with the workspace as its working directory. |
+| `apply_patch` | Apply a unified patch inside the workspace. |
+| `run_tests` | Run a test command with the configured timeout and output limit. |
+
+### Security Requirements
+
+Enabling these tools turns the API into a remote code and file access surface. **Configure `M365_API_KEYS` or `M365_API_KEY` before enabling them; API key authentication is mandatory for every deployment with coding tools enabled.** Do not expose such a deployment directly to the public internet. Use a least-privilege service account, a dedicated workspace, strict filesystem permissions, network isolation, and container resource limits.
+
+- **OWASP Broken Access Control:** a missing, leaked, or shared API key can let unauthorized callers read, modify, or execute within the mounted workspace. Use unique, rotated keys and enforce authorization at a trusted reverse proxy as well.
+- **Command Injection:** `shell_command` and `run_tests` execute model-selected command strings. Treat prompts, repository content, patches, and tool arguments as untrusted input; isolate the process and never provide production credentials.
+- **Path Traversal:** file tools confine resolved paths to `M365_WORKSPACE_DIR`, but an overly broad workspace or unsafe mount still exposes sensitive files. Mount only the required project directory and review symlinks and permissions.
+- **Sensitive Data Exposure:** tool output and file contents can be returned to the caller and sent to the M365 backend. Keep secrets, tokens, `.env` files, SSH keys, cloud credentials, and customer data outside the workspace.
+- **Resource exhaustion:** commands, recursive searches, large files, output, and repeated tool loops can consume CPU, memory, disk, and process capacity. Keep timeout, output, read, and iteration limits conservative and enforce container or OS quotas.
 
 ## Responses API
 

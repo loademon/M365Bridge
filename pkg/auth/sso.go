@@ -9,7 +9,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -25,13 +27,18 @@ import (
 const (
 	// ssoCookiesFile is the encrypted SSO cookie store.
 	ssoCookiesFile = "data/tokens/sso_cookies.json"
+	// m365CookiesFile is the browser-exported M365 web cookie store.
+	m365CookiesFile = "data/tokens/m365_cookies.json"
 	// authorizeURLTemplate is the OAuth2 authorize endpoint for silent re-auth.
 	authorizeURLTemplate = "https://login.microsoftonline.com/%s/oauth2/v2.0/authorize"
 	// defaultRedirectURI is the redirect URI registered for the M365 Copilot SPA app.
 	defaultRedirectURI = "https://m365.cloud.microsoft/spalanding"
 )
 
-// SSOCookie represents a single SSO cookie from login.microsoftonline.com.
+// ErrM365CookiesUnavailable indicates that no cookies for the M365 web app are stored.
+var ErrM365CookiesUnavailable = errors.New("M365 web app cookies unavailable")
+
+// SSOCookie represents a browser cookie used by M365 authentication or web APIs.
 type SSOCookie struct {
 	Name     string `json:"name"`
 	Value    string `json:"value"`
@@ -43,8 +50,8 @@ type SSOCookie struct {
 
 // SSOCookieStore holds all SSO cookies needed for silent re-authentication.
 type SSOCookieStore struct {
-	Cookies   []SSOCookie `json:"cookies"`
-	CapturedAt time.Time  `json:"capturedAt"`
+	Cookies    []SSOCookie `json:"cookies"`
+	CapturedAt time.Time   `json:"capturedAt"`
 }
 
 // generatePKCE creates a PKCE code verifier and code challenge (S256).
@@ -64,7 +71,7 @@ func generatePKCE() (verifier, challenge string, err error) {
 // SaveSSOCookies encrypts and stores SSO cookies to disk.
 func SaveSSOCookies(cookies []SSOCookie) error {
 	store := SSOCookieStore{
-		Cookies:   cookies,
+		Cookies:    cookies,
 		CapturedAt: time.Now(),
 	}
 
@@ -86,6 +93,31 @@ func SaveSSOCookies(cookies []SSOCookie) error {
 	}
 
 	return os.WriteFile(ssoCookiesFile, []byte(encrypted), 0600)
+}
+
+// SaveM365Cookies stores browser cookies used by M365 web APIs.
+func SaveM365Cookies(cookies []SSOCookie) error {
+	store := struct {
+		Domain      string      `json:"domain"`
+		ExtractedAt time.Time   `json:"extracted_at"`
+		Cookies     []SSOCookie `json:"cookies"`
+	}{
+		Domain:      "m365.cloud.microsoft",
+		ExtractedAt: time.Now(),
+		Cookies:     cookies,
+	}
+
+	data, err := json.MarshalIndent(store, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal M365 cookies: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(m365CookiesFile), 0700); err != nil {
+		return fmt.Errorf("failed to create M365 cookie directory: %w", err)
+	}
+	if err := os.WriteFile(m365CookiesFile, data, 0600); err != nil {
+		return fmt.Errorf("failed to save M365 cookies: %w", err)
+	}
+	return nil
 }
 
 // loadSSOCookies reads and decrypts SSO cookies from disk.
@@ -112,6 +144,38 @@ func (tm *TokenManager) loadSSOCookies() (*SSOCookieStore, error) {
 func hasSSOCookies() bool {
 	_, err := os.Stat(ssoCookiesFile)
 	return err == nil
+}
+
+// M365CookieHeader returns cookies scoped to the M365 web application.
+func (tm *TokenManager) M365CookieHeader() (string, error) {
+	data, err := os.ReadFile(m365CookiesFile)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrM365CookiesUnavailable, err)
+	}
+
+	var store struct {
+		Cookies []SSOCookie `json:"cookies"`
+	}
+	if err := json.Unmarshal(data, &store); err != nil {
+		return "", fmt.Errorf("%w: failed to parse M365 cookies: %v", ErrM365CookiesUnavailable, err)
+	}
+
+	var cookieParts []string
+	for _, cookie := range store.Cookies {
+		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
+		if domain != "m365.cloud.microsoft" && domain != "microsoft.com" {
+			continue
+		}
+		if cookie.Name == "" || cookie.Value == "" {
+			continue
+		}
+		cookieParts = append(cookieParts, cookie.Name+"="+cookie.Value)
+	}
+	if len(cookieParts) == 0 {
+		return "", ErrM365CookiesUnavailable
+	}
+
+	return strings.Join(cookieParts, "; "), nil
 }
 
 // reauthWithSSO performs silent re-authentication using stored SSO cookies.
@@ -287,6 +351,36 @@ func extractMetaRefreshURL(html string) string {
 	return strings.TrimSpace(content[urlIdx+4:])
 }
 
+func summarizeBrokerAuthorizeResponse(body string) string {
+	const aadSTSMarker = "AADSTS"
+	if start := strings.Index(body, aadSTSMarker); start >= 0 {
+		details := body[start:]
+		if end := strings.IndexAny(details, "<\r\n"); end >= 0 {
+			details = details[:end]
+		}
+		if details = strings.TrimSpace(html.UnescapeString(details)); details != "" {
+			return details
+		}
+	}
+
+	lowerBody := strings.ToLower(body)
+	if titleStart := strings.Index(lowerBody, "<title>"); titleStart >= 0 {
+		contentStart := titleStart + len("<title>")
+		if titleEnd := strings.Index(lowerBody[contentStart:], "</title>"); titleEnd >= 0 {
+			title := strings.TrimSpace(html.UnescapeString(body[contentStart : contentStart+titleEnd]))
+			if title != "" {
+				return "page title: " + title
+			}
+		}
+	}
+
+	compactBody := strings.Join(strings.Fields(body), " ")
+	if len(compactBody) > 300 {
+		compactBody = compactBody[:300]
+	}
+	return compactBody
+}
+
 // exchangeAuthCode exchanges an authorization code for access and refresh tokens.
 func (tm *TokenManager) exchangeAuthCode(authCode, verifier, cookieHeader string) (string, error) {
 	tokenData := url.Values{
@@ -391,6 +485,23 @@ type designerTokenCache struct {
 	ExpiresAt   int64  `json:"expires_at"`
 }
 
+// designerOAuthError represents an OAuth error returned by the broker token endpoint.
+type designerOAuthError struct {
+	Status      int
+	Code        string
+	Description string
+}
+
+// Error returns the broker OAuth error details.
+func (e *designerOAuthError) Error() string {
+	return fmt.Sprintf("designer broker token status %d: %s: %s", e.Status, e.Code, e.Description)
+}
+
+// isExpiredRefreshToken reports whether the broker refresh token must be replaced.
+func (e *designerOAuthError) isExpiredRefreshToken() bool {
+	return e.Code == "invalid_grant" && strings.Contains(e.Description, "AADSTS700084")
+}
+
 // GetDesignerToken returns a valid designerapp access token, acquiring a new
 // one via the broker refresh token flow if the cached token is expired or
 // missing. Falls back to SSO cookie broker authorize flow if no broker
@@ -433,20 +544,44 @@ func (tm *TokenManager) GetDesignerToken() (string, error) {
 // Uses a broker-compatible refresh token (stored in rt_broker.txt). If none
 // exists, falls back to SSO cookie broker authorize flow to obtain one.
 func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
-	// Try broker refresh token first
+	requestToken := tm.requestDesignerToken
+	if tm.designerTokenRequest != nil {
+		requestToken = tm.designerTokenRequest
+	}
+	acquireBrokerToken := tm.acquireBrokerRefreshTokenViaSSO
+	if tm.brokerTokenAcquisition != nil {
+		acquireBrokerToken = tm.brokerTokenAcquisition
+	}
+
 	refreshToken, err := tm.readBrokerRefreshToken()
 	if err != nil {
-		// No broker refresh token; acquire one via SSO cookies
 		logging.Info("acquireDesignerToken: no broker refresh token, acquiring via SSO cookies")
-		refreshToken, err = tm.acquireBrokerRefreshTokenViaSSO()
+		refreshToken, err = acquireBrokerToken()
 		if err != nil {
 			logging.Errorf("acquireDesignerToken: failed to acquire broker refresh token: %v", err)
 			return "", 0, fmt.Errorf("failed to acquire broker refresh token: %w", err)
 		}
-	} else {
-		logging.Debug("acquireDesignerToken: using existing broker refresh token")
+		return requestToken(refreshToken)
 	}
 
+	logging.Debug("acquireDesignerToken: using existing broker refresh token")
+	token, expiresIn, err := requestToken(refreshToken)
+	var oauthErr *designerOAuthError
+	if !errors.As(err, &oauthErr) || !oauthErr.isExpiredRefreshToken() {
+		return token, expiresIn, err
+	}
+
+	logging.Warn("acquireDesignerToken: broker refresh token expired, acquiring a new token via SSO cookies")
+	refreshToken, err = acquireBrokerToken()
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to reacquire expired broker refresh token: %w", err)
+	}
+
+	return requestToken(refreshToken)
+}
+
+// requestDesignerToken exchanges a broker refresh token for a designer access token.
+func (tm *TokenManager) requestDesignerToken(refreshToken string) (string, int, error) {
 	// Build the broker token URL with query parameters
 	tokenURL := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token?brk_client_id=%s&brk_redirect_uri=%s&client_id=%s&client-request-id=%s",
 		tm.tenant,
@@ -458,17 +593,17 @@ func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
 
 	// Build the request body matching MSAL.js broker flow
 	body := url.Values{
-		"client_id":                {brokerClientID},
-		"redirect_uri":             {designerBrokerRedirectURI},
-		"scope":                    {designerBrokerScope},
-		"grant_type":               {"refresh_token"},
-		"client_info":              {"1"},
-		"x-client-SKU":             {"msal.js.browser"},
-		"x-client-VER":             {"5.9.0"},
-		"x-ms-lib-capability":      {"retry-after, h429"},
+		"client_id":                  {brokerClientID},
+		"redirect_uri":               {designerBrokerRedirectURI},
+		"scope":                      {designerBrokerScope},
+		"grant_type":                 {"refresh_token"},
+		"client_info":                {"1"},
+		"x-client-SKU":               {"msal.js.browser"},
+		"x-client-VER":               {"5.9.0"},
+		"x-ms-lib-capability":        {"retry-after, h429"},
 		"x-client-current-telemetry": {"5|61,0,,,|,"},
 		"x-client-last-telemetry":    {"5|0|||0,0"},
-		"refresh_token":            {refreshToken},
+		"refresh_token":              {refreshToken},
 	}
 
 	// X-AnchorMailbox helps AAD route the request to the correct token service
@@ -503,6 +638,17 @@ func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		var oauthResult struct {
+			Error            string `json:"error"`
+			ErrorDescription string `json:"error_description"`
+		}
+		if err := json.Unmarshal(respBody, &oauthResult); err == nil && oauthResult.Error != "" {
+			return "", 0, &designerOAuthError{
+				Status:      resp.StatusCode,
+				Code:        oauthResult.Error,
+				Description: oauthResult.ErrorDescription,
+			}
+		}
 		return "", 0, fmt.Errorf("designer broker token status %d: %s", resp.StatusCode, string(respBody)[:min(300, len(respBody))])
 	}
 
@@ -517,7 +663,9 @@ func (tm *TokenManager) acquireDesignerToken() (string, int, error) {
 
 	// Save rotated broker refresh token if returned
 	if result.RefreshToken != "" {
-		tm.writeBrokerRefreshToken(result.RefreshToken)
+		if err := tm.writeBrokerRefreshToken(result.RefreshToken); err != nil {
+			return "", 0, fmt.Errorf("failed to save rotated broker refresh token: %w", err)
+		}
 	}
 
 	return result.AccessToken, result.ExpiresIn, nil
@@ -576,52 +724,78 @@ func (tm *TokenManager) acquireBrokerRefreshTokenViaSSO() (string, error) {
 		Timeout: 15 * time.Second,
 	}
 
-	resp, err := httpClient.Do(authReq)
+	currentResp, err := httpClient.Do(authReq)
 	if err != nil && !strings.Contains(err.Error(), "ErrUseLastResponse") {
 		return "", fmt.Errorf("broker authorize request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer currentResp.Body.Close()
 
-	// The redirect should be to https://m365.cloud.microsoft/spalanding#code=...
-	// because AAD redirects to brk_redirect_uri, not redirect_uri
-	location := resp.Header.Get("Location")
-	if location == "" {
-		body, _ := io.ReadAll(resp.Body)
-		bodyStr := string(body)
-		if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
-			location = metaURL
-		} else {
-			if len(bodyStr) > 500 {
-				bodyStr = bodyStr[:500]
+	// Follow redirects manually until we get the auth code or reach brk_redirect_uri.
+	// Microsoft AAD may return intermediate redirects (e.g. /jsdisabled, /kmsi)
+	// before the final redirect to spalanding#code=..., especially in headless/Docker
+	// environments where JS is not available.
+	const maxRedirects = 10
+	for i := 0; i < maxRedirects; i++ {
+		location := currentResp.Header.Get("Location")
+		if location == "" {
+			body, _ := io.ReadAll(currentResp.Body)
+			bodyStr := string(body)
+			// Check for meta refresh redirect in HTML (AAD sometimes uses this)
+			if metaURL := extractMetaRefreshURL(bodyStr); metaURL != "" {
+				location = metaURL
+			} else {
+				return "", fmt.Errorf("no redirect from broker authorize (status %d, hop %d): %s", currentResp.StatusCode, i, summarizeBrokerAuthorizeResponse(bodyStr))
 			}
-			return "", fmt.Errorf("no redirect from broker authorize (status %d): %s", resp.StatusCode, bodyStr)
 		}
-	}
 
-	// Extract auth code from fragment
-	locURL, err := url.Parse(location)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse broker redirect URL: %w", err)
-	}
+		logging.Debugf("acquireBrokerRefreshTokenViaSSO: redirect hop %d -> %s", i, location[:min(120, len(location))])
 
-	authCode := locURL.Query().Get("code")
-	if authCode == "" {
-		fragment := locURL.Fragment
-		if fragment != "" {
-			fragParams, _ := url.ParseQuery(fragment)
-			authCode = fragParams.Get("code")
+		// Check if this is the final redirect with auth code (brk_redirect_uri = spalanding)
+		if strings.Contains(location, "m365.cloud.microsoft") {
+			locURL, err := url.Parse(location)
+			if err != nil {
+				return "", fmt.Errorf("failed to parse broker redirect URL: %w", err)
+			}
+
+			authCode := locURL.Query().Get("code")
 			if authCode == "" {
-				return "", fmt.Errorf("broker authorize error: %s: %s", fragParams.Get("error"), fragParams.Get("error_description"))
+				// Check for code in fragment (response_mode=fragment)
+				fragment := locURL.Fragment
+				if fragment != "" {
+					fragParams, _ := url.ParseQuery(fragment)
+					authCode = fragParams.Get("code")
+					if authCode == "" {
+						errCode := fragParams.Get("error")
+						errDesc := fragParams.Get("error_description")
+						return "", fmt.Errorf("broker authorize error: %s: %s", errCode, errDesc)
+					}
+				}
+			}
+			if authCode != "" {
+				logging.Info("acquireBrokerRefreshTokenViaSSO: obtained auth code, exchanging for broker tokens")
+				return tm.exchangeBrokerAuthCode(authCode, verifier)
 			}
 		}
-	}
-	if authCode == "" {
-		return "", fmt.Errorf("no auth code in broker authorize redirect: %s", location[:min(200, len(location))])
+
+		// Follow the redirect, forwarding SSO cookies
+		redirectReq, err := http.NewRequest("GET", location, nil)
+		if err != nil {
+			return "", fmt.Errorf("failed to create broker redirect request (hop %d): %w", i, err)
+		}
+		redirectReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+		redirectReq.Header.Set("Referer", "https://login.microsoftonline.com/")
+		redirectReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		redirectReq.Header.Set("Cookie", cookieHeader)
+
+		currentResp.Body.Close()
+		currentResp, err = httpClient.Do(redirectReq)
+		if err != nil && !strings.Contains(err.Error(), "ErrUseLastResponse") {
+			return "", fmt.Errorf("broker redirect request failed (hop %d): %w", i, err)
+		}
+		defer currentResp.Body.Close()
 	}
 
-	// Exchange auth code for token + refresh token via broker flow
-	logging.Info("acquireBrokerRefreshTokenViaSSO: obtained auth code, exchanging for broker tokens")
-	return tm.exchangeBrokerAuthCode(authCode, verifier)
+	return "", fmt.Errorf("broker authorize: max redirects (%d) reached without obtaining auth code", maxRedirects)
 }
 
 // exchangeBrokerAuthCode exchanges an authorization code for a broker
@@ -636,15 +810,15 @@ func (tm *TokenManager) exchangeBrokerAuthCode(authCode, verifier string) (strin
 	)
 
 	body := url.Values{
-		"client_id":         {brokerClientID},
-		"redirect_uri":      {designerBrokerRedirectURI},
-		"scope":             {designerBrokerScope},
-		"grant_type":        {"authorization_code"},
-		"code":              {authCode},
-		"code_verifier":     {verifier},
-		"client_info":       {"1"},
-		"brk_client_id":     {designerClientID},
-		"brk_redirect_uri":  {defaultRedirectURI},
+		"client_id":        {brokerClientID},
+		"redirect_uri":     {designerBrokerRedirectURI},
+		"scope":            {designerBrokerScope},
+		"grant_type":       {"authorization_code"},
+		"code":             {authCode},
+		"code_verifier":    {verifier},
+		"client_info":      {"1"},
+		"brk_client_id":    {designerClientID},
+		"brk_redirect_uri": {defaultRedirectURI},
 	}
 
 	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(body.Encode()))
