@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [1.3.7] - 2026-07-14
+
+### Added
+- Live-stream filtered reasoning/thinking on the OpenAI chat, OpenAI Responses, and Anthropic streaming endpoints
+- Re-ask the backend once when simulated tool calls drop required arguments, applied across all endpoints
+- Log the parsed tool-call count in the Anthropic simulated parser for parity with the OpenAI parser
+
+### Changed
+- Unify the simulated thinking/transport-envelope filter across all endpoints
+
+### Fixed
+- Stream Anthropic `tool_use` input as `input_json_delta` on both the direct and buffered streaming paths so SDK clients accumulate arguments correctly
+- Drop simulated tool calls that are missing required arguments before emitting them
+
 ## [1.3.6] - 2026-07-12
 
 ### Changed
