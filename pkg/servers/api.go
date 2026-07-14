@@ -2546,30 +2546,15 @@ func (api *APIServer) injectJSONMode(messages *[]payload.Message) {
 	*messages = append([]payload.Message{{Role: "system", Content: instruction}}, *messages...)
 }
 
-var chatAnthropicSimulationMetaPattern = regexp.MustCompile(
-	`(?i)(generat\w*\s+(a\s+|the\s+)?json|chatcmpl-|chat\.completion|simulat\w+\s+(an?\s+)?(openai|anthropic)?\s*response|json\s+(code\s+)?block|"?tool_calls"?|"?finish_reason"?)`,
-)
-
+// chatAnthropicThinkingForOutput strips the simulated transport envelope from a
+// complete thinking string for non-streaming and OpenAI callers. It delegates
+// to toolcalling.FilterTransportThinking so every endpoint (streaming and
+// non-streaming) applies the exact same filter.
 func chatAnthropicThinkingForOutput(thinking string, simulated bool) string {
 	if !simulated || thinking == "" {
 		return thinking
 	}
-
-	var output []string
-	inFence := false
-	for line := range strings.SplitSeq(thinking, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
-			continue
-		}
-		if inFence || chatAnthropicSimulationMetaPattern.MatchString(line) {
-			continue
-		}
-		output = append(output, line)
-	}
-
-	return strings.TrimSpace(strings.Join(output, "\n"))
+	return toolcalling.FilterTransportThinking(thinking)
 }
 
 // injectSimulatedPrompt replaces the last user message with a simulated-mode
