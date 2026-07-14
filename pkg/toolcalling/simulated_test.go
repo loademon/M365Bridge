@@ -1,6 +1,7 @@
 package toolcalling
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -243,10 +244,11 @@ func TestParseSimulatedResponseAnthropicDropsToolUseWithEmptyRequiredArg(t *test
 	}
 }
 
-func TestRequiredArgsByToolReadsBothSchemaShapes(t *testing.T) {
+func TestRequiredArgsByToolReadsAllProviderSchemaShapes(t *testing.T) {
 	tools := []ToolDef{
 		{Name: "Agent", InputSchema: map[string]any{"required": []any{"description", "prompt"}}},
 		{Function: ToolDefFunc{Name: "Run", Parameters: map[string]any{"required": []any{"cmd"}}}},
+		{Name: "ResponsesRun", Parameters: map[string]any{"required": []string{"input"}}},
 		{Name: "NoSchema"},
 	}
 
@@ -258,8 +260,40 @@ func TestRequiredArgsByToolReadsBothSchemaShapes(t *testing.T) {
 	if strings.Join(got["Run"], ",") != "cmd" {
 		t.Fatalf("Run required = %v, want [cmd]", got["Run"])
 	}
+	if strings.Join(got["ResponsesRun"], ",") != "input" {
+		t.Fatalf("ResponsesRun required = %v, want [input]", got["ResponsesRun"])
+	}
 	if len(got["NoSchema"]) != 0 {
 		t.Fatalf("NoSchema required = %v, want empty", got["NoSchema"])
+	}
+}
+
+func TestToolDefMarshalPreservesProviderShapes(t *testing.T) {
+	tools := []ToolDef{
+		{Name: "AnthropicTool", Description: "flat", InputSchema: map[string]any{"type": "object"}},
+		{Type: "function", Function: ToolDefFunc{Name: "ChatTool", Parameters: map[string]any{"type": "object"}}},
+		{Type: "function", Name: "ResponsesTool", Parameters: map[string]any{"type": "object"}},
+	}
+
+	encoded, err := json.Marshal(tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded []map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := decoded[0]["function"]; ok {
+		t.Fatalf("Anthropic tool gained an OpenAI function wrapper: %s", encoded)
+	}
+	if _, ok := decoded[0]["input_schema"]; !ok {
+		t.Fatalf("Anthropic input_schema was lost: %s", encoded)
+	}
+	if _, ok := decoded[1]["function"]; !ok {
+		t.Fatalf("Chat function wrapper was lost: %s", encoded)
+	}
+	if _, ok := decoded[2]["parameters"]; !ok {
+		t.Fatalf("Responses parameters were lost: %s", encoded)
 	}
 }
 

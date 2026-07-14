@@ -552,6 +552,36 @@ func TestParseResponsesSimulationRejectsAmbiguousUnqualifiedNamespace(t *testing
 	}
 }
 
+func TestResponsesLoadedToolsPreserveFunctionSchema(t *testing.T) {
+	input := []any{
+		map[string]any{
+			"type": "tool_search_output",
+			"tools": []any{
+				map[string]any{
+					"type":        "function",
+					"name":        "Read",
+					"description": "Read a file",
+					"parameters": map[string]any{
+						"type":     "object",
+						"required": []any{"file_path"},
+					},
+				},
+			},
+		},
+	}
+
+	tools := mergeLoadedResponsesTools(input, nil)
+	if len(tools) != 1 {
+		t.Fatalf("loaded tool count = %d, want 1", len(tools))
+	}
+	if got := tools[0].Parameters["required"].([]any); len(got) != 1 || got[0] != "file_path" {
+		t.Fatalf("loaded required schema = %#v", tools[0].Parameters["required"])
+	}
+	if got := toolcalling.RequiredArgsByTool(tools)["Read"]; len(got) != 1 || got[0] != "file_path" {
+		t.Fatalf("required arguments = %v, want [file_path]", got)
+	}
+}
+
 func TestResponsesInputPreservesToolSearchAndCompactionHistory(t *testing.T) {
 	input := []any{
 		map[string]any{

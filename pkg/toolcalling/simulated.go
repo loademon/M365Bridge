@@ -149,9 +149,9 @@ func BuildSimulatedPromptAnthropic(requestJSON string, hasTools bool, toolChoice
 }
 
 // RequiredArgsByTool maps each declared tool name to the argument keys its JSON
-// schema marks as required. It reads Anthropic `input_schema` or OpenAI
-// `function.parameters`, whichever the tool definition carries. Tools without a
-// schema or without a `required` array map to an empty slice (no validation).
+// schema marks as required. It supports Anthropic `input_schema`, OpenAI Chat
+// Completions `function.parameters`, and Responses top-level `parameters`.
+// Tools without a schema or without a `required` array map to an empty slice.
 func RequiredArgsByTool(tools []ToolDef) map[string][]string {
 	out := make(map[string][]string, len(tools))
 	for i := range tools {
@@ -159,27 +159,47 @@ func RequiredArgsByTool(tools []ToolDef) map[string][]string {
 		if name == "" {
 			continue
 		}
-		schema := tools[i].InputSchema
-		if schema == nil {
-			schema = tools[i].Function.Parameters
+		schemas := []map[string]any{
+			tools[i].InputSchema,
+			tools[i].Parameters,
+			tools[i].Function.Parameters,
 		}
-		out[name] = requiredFromSchema(schema)
+		var required []string
+		for _, schema := range schemas {
+			if candidate := requiredFromSchema(schema); len(candidate) > 0 {
+				required = candidate
+				break
+			}
+		}
+		out[name] = required
 	}
 	return out
 }
 
 // requiredFromSchema extracts the string entries of a JSON schema's top-level
-// `required` array.
+// `required` array from either JSON-decoded values or programmatic definitions.
 func requiredFromSchema(schema map[string]any) []string {
 	if schema == nil {
 		return nil
 	}
-	rawRequired, ok := schema["required"].([]any)
+	rawRequired, ok := schema["required"]
 	if !ok {
 		return nil
 	}
-	required := make([]string, 0, len(rawRequired))
-	for _, entry := range rawRequired {
+	var entries []any
+	switch values := rawRequired.(type) {
+	case []any:
+		entries = values
+	case []string:
+		entries = make([]any, len(values))
+		for i, value := range values {
+			entries[i] = value
+		}
+	default:
+		return nil
+	}
+	required := make([]string, 0, len(entries))
+	for _, entry := range entries {
 		if key, ok := entry.(string); ok && key != "" {
 			required = append(required, key)
 		}
